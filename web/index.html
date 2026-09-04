@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TikTok / 抖音 无水印视频下载器 · 网页版</title>
+<link rel="stylesheet" href="https://miaoda.feishu.cn/fonts/css2?family=Noto+Sans+SC:wght@400;500;700;900&display=swap">
+<style>
+  :root{
+    --bg:#0A0D12;
+    --bg2:#0F141C;
+    --card:#131922;
+    --card2:#0F151D;
+    --line:#212B38;
+    --line2:rgba(37,244,238,0.25);
+    --text:#EDF3F9;
+    --text2:#94A3B4;
+    --text3:#5D6B7C;
+    --cyan:#25F4EE;
+    --cyan-soft:rgba(37,244,238,0.10);
+    --red:#FE2C55;
+    --red-soft:rgba(254,44,85,0.10);
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html{scroll-behavior:smooth;}
+  body{
+    font-family:'Noto Sans SC','PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:0 20px;}
+
+  /* ===== 背景氛围光晕 ===== */
+  .bgfx{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden;}
+  .bgfx::before,.bgfx::after{content:"";position:absolute;border-radius:50%;filter:blur(120px);opacity:0.5;}
+  .bgfx::before{width:520px;height:520px;top:-160px;left:-120px;background:rgba(37,244,238,0.14);}
+  .bgfx::after{width:460px;height:460px;top:24%;right:-180px;background:rgba(254,44,85,0.11);}
+
+  /* ===== Header ===== */
+  header{position:relative;z-index:20;}
+  .nav{display:flex;align-items:center;justify-content:space-between;height:64px;gap:16px;border-bottom:1px solid rgba(33,43,56,0.6);}
+  .brand{display:flex;align-items:center;gap:11px;font-weight:900;font-size:16px;letter-spacing:0.2px;white-space:nowrap;}
+  .brand .logo{width:30px;height:30px;flex:none;}
+  .brand b{color:var(--text);}
+  .brand b em{font-style:normal;color:var(--cyan);}
+  .nav .gh{
+    display:inline-flex;align-items:center;gap:8px;height:40px;padding:0 15px;
+    border:1px solid var(--line);border-radius:999px;color:var(--text2);
+    text-decoration:none;font-size:13px;font-weight:500;white-space:nowrap;
+    transition:border-color .15s,color .15s,transform .15s,box-shadow .15s;
+  }
+  .nav .gh:hover{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 0 3px var(--cyan-soft);transform:translateY(-1px);}
+  .nav .gh svg{width:16px;height:16px;}
+
+  /* ===== Hero ===== */
+  .hero{position:relative;z-index:1;padding:58px 0 34px;text-align:center;}
+  .hero .kicker{
+    display:inline-flex;align-items:center;gap:8px;
+    font-size:12.5px;font-weight:700;color:var(--cyan);
+    border:1px solid var(--line2);background:var(--cyan-soft);
+    padding:6px 14px;border-radius:999px;letter-spacing:0.4px;margin-bottom:20px;
+  }
+  .hero .kicker .dot{width:7px;height:7px;border-radius:50%;background:var(--cyan);box-shadow:0 0 10px var(--cyan);}
+  h1{font-size:clamp(30px,5.2vw,48px);font-weight:900;line-height:1.18;letter-spacing:-0.5px;}
+  h1 .g1{background:linear-gradient(92deg,var(--cyan),#7ce7e4);-webkit-background-clip:text;background-clip:text;color:transparent;}
+  h1 .g2{background:linear-gradient(92deg,#ff7a97,var(--red));-webkit-background-clip:text;background-clip:text;color:transparent;}
+  .hero .sub{max-width:600px;margin:14px auto 0;color:var(--text2);font-size:15px;}
+
+  /* 输入区 */
+  .dock{
+    max-width:720px;margin:32px auto 0;
+    background:linear-gradient(180deg,rgba(19,25,34,0.96),rgba(15,21,29,0.96));
+    border:1px solid var(--line);border-radius:20px;
+    padding:20px;box-shadow:0 24px 60px rgba(0,0,0,0.5);
+    backdrop-filter:blur(8px);
+  }
+  .dock .bar{display:flex;gap:12px;}
+  .dock input{
+    flex:1;min-width:0;height:56px;padding:0 20px;border-radius:14px;
+    background:var(--bg);border:1px solid var(--line);color:var(--text);
+    font-size:15px;font-family:inherit;outline:none;
+    transition:border-color .15s,box-shadow .15s;
+  }
+  .dock input::placeholder{color:var(--text3);}
+  .dock input:focus{border-color:var(--cyan);box-shadow:0 0 0 3px var(--cyan-soft);}
+  .dock button{
+    flex:none;height:56px;padding:0 26px;border:none;border-radius:14px;cursor:pointer;
+    background:linear-gradient(92deg,var(--cyan),#0fc4bd);
+    color:#05211f;font-size:15px;font-weight:900;font-family:inherit;letter-spacing:0.3px;
+    display:inline-flex;align-items:center;gap:9px;
+    box-shadow:0 8px 24px rgba(37,244,238,0.25);
+    transition:filter .15s,transform .15s,box-shadow .15s;
+  }
+  .dock button:hover{filter:brightness(1.06);transform:translateY(-1px);box-shadow:0 12px 30px rgba(37,244,238,0.32);}
+  .dock button:disabled{filter:grayscale(0.55) brightness(0.7);cursor:not-allowed;transform:none;box-shadow:none;}
+  .dock button svg{width:18px;height:18px;}
+  .dock .hint{margin-top:14px;font-size:12.5px;color:var(--text3);text-align:left;display:flex;align-items:center;gap:7px;}
+  .dock .hint svg{width:13px;height:13px;flex:none;color:var(--text3);}
+
+  /* 解析状态 */
+  .status{margin-top:14px;font-size:13px;color:var(--text2);display:none;align-items:center;gap:9px;justify-content:flex-start;}
+  .status.show{display:flex;}
+  .status.err{color:var(--red);}
+  .status .spin{
+    width:15px;height:15px;border-radius:50%;flex:none;
+    border:2px solid var(--line);border-top-color:var(--cyan);
+    animation:sp 0.8s linear infinite;
+  }
+  @keyframes sp{to{transform:rotate(360deg);}}
+
+  /* ===== 结果卡片（横向媒体卡） ===== */
+  .result{display:none;max-width:760px;margin:26px auto 0;position:relative;z-index:1;}
+  .result.show{display:block;}
+  .vcard{
+    background:linear-gradient(180deg,rgba(19,25,34,0.97),rgba(15,21,29,0.97));
+    border:1px solid var(--line);border-radius:20px;overflow:hidden;
+    box-shadow:0 24px 60px rgba(0,0,0,0.5);
+    display:grid;grid-template-columns:280px 1fr;
+  }
+  .vmedia{position:relative;background:#000;min-height:360px;}
+  .vmedia img{width:100%;height:100%;object-fit:cover;display:block;position:absolute;inset:0;}
+  .vmedia video{width:100%;height:100%;object-fit:contain;display:block;background:#000;position:absolute;inset:0;}
+  .vmedia .shade{position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,0.02) 55%,rgba(0,0,0,0.55));pointer-events:none;}
+  .vmedia .playbtn{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:62px;height:62px;border-radius:50%;border:1px solid rgba(255,255,255,0.3);cursor:pointer;
+    background:rgba(0,0,0,0.55);color:#fff;backdrop-filter:blur(6px);
+    display:flex;align-items:center;justify-content:center;
+    transition:background .18s,color .18s,transform .18s,box-shadow .18s;
+    z-index:2;
+  }
+  .vmedia .playbtn:hover{background:var(--cyan);color:#06282a;transform:translate(-50%,-50%) scale(1.08);box-shadow:0 0 30px rgba(37,244,238,0.5);}
+  .vmedia .playbtn svg{width:26px;height:26px;margin-left:3px;}
+  .vmedia .dur{
+    position:absolute;right:12px;bottom:12px;padding:3px 9px;border-radius:7px;
+    background:rgba(0,0,0,0.72);color:#fff;font-size:12px;font-weight:700;z-index:2;
+  }
+  .vmedia .wmark{
+    position:absolute;left:12px;bottom:12px;z-index:2;display:flex;align-items:center;gap:6px;
+    font-size:11px;font-weight:700;color:rgba(255,255,255,0.85);
+    background:rgba(0,0,0,0.5);padding:4px 9px;border-radius:999px;backdrop-filter:blur(4px);
+  }
+  .vmedia .wmark svg{width:12px;height:12px;color:var(--cyan);}
+
+  .vinfo{padding:22px 24px;display:flex;flex-direction:column;min-width:0;text-align:left;}
+  .vmeta{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;}
+  .vmeta .author{
+    display:inline-flex;align-items:center;gap:8px;
+    font-size:13.5px;font-weight:800;color:var(--text);
+  }
+  .vmeta .author .avatar{
+    width:30px;height:30px;border-radius:50%;flex:none;
+    background:linear-gradient(135deg,var(--cyan),var(--red));
+    display:flex;align-items:center;justify-content:center;color:#06282a;
+  }
+  .vmeta .author .avatar svg{width:16px;height:16px;}
+  .vmeta .author small{color:var(--cyan);font-weight:600;font-size:12px;margin-left:2px;}
+  .vmeta .src{margin-left:auto;font-size:11px;color:var(--text3);border:1px solid var(--line);padding:3px 10px;border-radius:999px;background:var(--bg2);}
+  .vtitle{font-size:15.5px;font-weight:700;line-height:1.55;color:var(--text);word-break:break-word;}
+  .vtitle .htag{color:var(--cyan);font-weight:700;}
+  .vacts{display:flex;gap:10px;margin-top:auto;padding-top:18px;flex-wrap:wrap;}
+  .vacts a,.vacts button{
+    flex:1 1 160px;min-height:50px;border-radius:14px;cursor:pointer;
+    display:inline-flex;align-items:center;justify-content:center;gap:9px;
+    font-size:14px;font-weight:800;font-family:inherit;text-decoration:none;
+    transition:filter .15s,transform .15s,box-shadow .15s;
+  }
+  .vacts a:hover,.vacts button:hover{filter:brightness(1.06);transform:translateY(-1px);}
+  .vacts .dl{
+    background:linear-gradient(92deg,var(--red),#e02850);color:#fff;border:none;
+    box-shadow:0 8px 24px rgba(254,44,85,0.28);
+  }
+  .vacts .dl:hover{box-shadow:0 12px 30px rgba(254,44,85,0.36);}
+  .vacts .open{background:var(--bg);color:var(--text);border:1px solid var(--line);}
+  .vacts .open:hover{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 0 3px var(--cyan-soft);}
+  .vacts .open svg{width:16px;height:16px;color:var(--cyan);}
+  .vnote{margin-top:12px;font-size:12px;color:var(--text3);display:flex;gap:7px;align-items:flex-start;line-height:1.6;}
+  .vnote svg{width:13px;height:13px;flex:none;margin-top:2px;}
+
+  /* ===== 步骤 ===== */
+  .steps{position:relative;z-index:1;padding:48px 0 8px;}
+  .sec-head{text-align:center;margin-bottom:28px;}
+  .sec-head .tag{font-size:12px;font-weight:700;color:var(--red);letter-spacing:2.5px;margin-bottom:8px;}
+  .sec-head h2{font-size:24px;font-weight:900;letter-spacing:-0.3px;}
+  .stepgrid{display:flex;gap:16px;flex-wrap:wrap;justify-content:center;}
+  .step{
+    flex:1 1 220px;max-width:320px;background:var(--card);border:1px solid var(--line);
+    border-radius:18px;padding:22px 20px;text-align:left;
+    transition:transform .15s,border-color .15s;
+  }
+  .step:hover{transform:translateY(-3px);border-color:var(--line2);}
+  .step .num{
+    width:36px;height:36px;border-radius:11px;display:flex;align-items:center;justify-content:center;
+    background:var(--cyan-soft);color:var(--cyan);font-weight:900;font-size:15px;margin-bottom:14px;
+  }
+  .step h3{font-size:15px;font-weight:800;margin-bottom:6px;}
+  .step p{font-size:13px;color:var(--text2);}
+
+  /* ===== 对比 ===== */
+  .compare{position:relative;z-index:1;padding:56px 0 8px;}
+  .cols{display:flex;gap:18px;flex-wrap:wrap;align-items:stretch;}
+  .cbox{
+    flex:1 1 320px;border-radius:20px;padding:24px;border:1px solid var(--line);
+    display:flex;flex-direction:column;background:var(--card);
+    transition:transform .15s,border-color .15s;
+  }
+  .cbox:hover{transform:translateY(-3px);}
+  .cbox.web:hover{border-color:var(--line2);}
+  .cbox.plug{border-color:var(--line2);background:linear-gradient(180deg,rgba(37,244,238,0.05),rgba(254,44,85,0.05));}
+  .cbox .chead{display:flex;align-items:center;gap:11px;margin-bottom:16px;}
+  .cbox .chead .ico{width:38px;height:38px;border-radius:12px;display:flex;align-items:center;justify-content:center;flex:none;}
+  .cbox.web .chead .ico{background:var(--bg2);border:1px solid var(--line);color:var(--cyan);}
+  .cbox.plug .chead .ico{background:linear-gradient(135deg,var(--cyan),var(--red));color:#06282a;}
+  .cbox .chead .ico svg{width:19px;height:19px;}
+  .cbox .chead b{font-size:16px;font-weight:900;display:block;}
+  .cbox .chead small{font-size:11.5px;color:var(--text2);font-weight:500;}
+  .cbox ul{list-style:none;display:flex;flex-direction:column;gap:12px;margin-top:2px;flex:1;}
+  .cbox li{display:flex;gap:10px;font-size:13px;color:var(--text2);align-items:flex-start;}
+  .cbox li svg{width:15px;height:15px;flex:none;margin-top:2px;}
+  .cbox li.good svg{color:var(--cyan);}
+  .cbox li.bad svg{color:var(--text3);}
+  .cbox li b{color:var(--text);font-weight:700;}
+  .cbox .ft{margin-top:18px;padding-top:15px;border-top:1px solid var(--line);font-size:12.5px;color:var(--text2);}
+  .cbox.plug .ft a{color:var(--cyan);text-decoration:none;font-weight:700;}
+  .cbox.plug .ft a:hover{text-decoration:underline;}
+
+  /* ===== Footer ===== */
+  footer{position:relative;z-index:1;border-top:1px solid rgba(33,43,56,0.6);margin-top:56px;padding:26px 0 40px;text-align:center;}
+  footer .flinks{display:flex;justify-content:center;gap:22px;flex-wrap:wrap;margin-bottom:14px;}
+  footer .flinks a{color:var(--text2);text-decoration:none;font-size:13px;display:inline-flex;align-items:center;gap:6px;}
+  footer .flinks a svg{width:14px;height:14px;}
+  footer .flinks a:hover{color:var(--cyan);}
+  footer .disc{font-size:12px;color:var(--text3);max-width:640px;margin:0 auto;line-height:1.7;}
+
+  @media (max-width:760px){
+    .hero{padding:40px 0 24px;}
+    .vcard{grid-template-columns:1fr;}
+    .vmedia{min-height:0;aspect-ratio:9/16;max-height:70vh;}
+    .vinfo{padding:18px 18px 20px;}
+    .vacts a,.vacts button{flex-basis:100%;}
+    .dock{padding:14px;}
+    .dock .bar{flex-direction:column;}
+    .dock button{width:100%;justify-content:center;height:54px;}
+    .step{flex-basis:100%;}
+    .cbox{flex-basis:100%;}
+  }
+</style>
+</head>
+<body>
+
+<div class="bgfx" aria-hidden="true"></div>
+
+<header>
+  <div class="wrap nav">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <rect x="1" y="1" width="30" height="30" rx="9" fill="#10151D" stroke="#212B38"/>
+        <path d="M13.5 10.5v8.2a3.1 3.1 0 1 1-2-2.9v-3.2a6.3 6.3 0 1 0 5 6.2V11a6.6 6.6 0 0 0 4 3.7v-3.4a3.2 3.2 0 0 1-2.3-3.1h-2.5v10.1a1 1 0 0 1-1 .9 1 1 0 0 1-.9-1V10.5h-.3z" fill="#25F4EE"/>
+        <path d="M24.5 8.5a5 5 0 0 1-3.8-1.8 5 5 0 0 1-1.2-3.2h-3.2a7.8 7.8 0 0 0 2.2 5.4 7.8 7.8 0 0 0 6 2.6V8.5z" fill="#FE2C55"/>
+      </svg>
+      <b>TikTok<em>/</em>抖音 下载器</b>
+    </div>
+    <a class="gh" href="https://github.com/xzzz0371-maker/tiktok-downloader-v3" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.6.5.5 5.6.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.8 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 5 18.3 5.3 18.3 5.3c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.5-2.7 5.5-5.3 5.8.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A11.5 11.5 0 0 0 23.5 12C23.5 5.6 18.4.5 12 .5z"/></svg>
+      GitHub
+    </a>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ===== Hero + 下载工具 ===== -->
+  <section class="hero">
+    <div class="kicker"><span class="dot"></span>100% 免费 · 无需安装 · 无需登录</div>
+    <h1>网页版<span class="g1">无水印</span>视频下载器</h1>
+    <p class="sub">粘贴一个 TikTok 或抖音视频链接，一键解析无水印视频。单链接逐个使用，简单直接。</p>
+
+    <div class="dock">
+      <div class="bar">
+        <input id="urlInput" type="text" spellcheck="false"
+               placeholder="粘贴视频链接，如 https://www.tiktok.com/@user/video/123... 或 https://v.douyin.com/xxx" autocomplete="off">
+        <button id="parseBtn" type="button">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5-11-6.5z"/></svg>
+          解析视频
+        </button>
+      </div>
+      <div class="hint">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v5l3 2"/></svg>
+        支持 www.tiktok.com、vm/vt.tiktok.com、www.douyin.com、v.douyin.com 短链
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+
+    <!-- 解析结果 -->
+    <div id="result" class="result">
+      <div class="vcard">
+        <div class="vmedia">
+          <img id="vCover" alt="" hidden>
+          <video id="vPlayer" controls playsinline preload="metadata" hidden></video>
+          <button id="vPlayBtn" class="playbtn" type="button" aria-label="预览视频" hidden>
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5-11-6.5z"/></svg>
+          </button>
+          <span class="wmark" id="vWmark" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M12 3v18M4 12h16"/></svg>
+            无水印
+          </span>
+          <span id="vDur" class="dur" hidden></span>
+          <span class="shade" aria-hidden="true"></span>
+        </div>
+        <div class="vinfo">
+          <div class="vmeta">
+            <span class="author">
+              <span class="avatar">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-4.4 0-8 2.2-8 5v1h16v-1c0-2.8-3.6-5-8-5z"/></svg>
+              </span>
+              <span id="vAuthor"></span><small>发布者</small>
+            </span>
+            <span id="vSource" class="src"></span>
+          </div>
+          <div id="vTitle" class="vtitle"></div>
+          <div class="vacts">
+            <a id="vDownload" class="dl" href="#" download>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 21h16"/></svg>
+              下载无水印视频
+            </a>
+            <a id="vOpen" class="open" href="#" target="_blank" rel="noopener">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/></svg>
+              新窗口打开原视频
+            </a>
+          </div>
+          <div class="vnote">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8.5h.01"/></svg>
+            <span>若点击下载后浏览器直接播放视频，请在新页面点击播放器右下角或右键选择「视频另存为」保存到本地。</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 使用步骤 ===== -->
+  <section class="steps">
+    <div class="sec-head">
+      <div class="tag">HOW IT WORKS</div>
+      <h2>三步搞定</h2>
+    </div>
+    <div class="stepgrid">
+      <div class="step">
+        <div class="num">1</div>
+        <h3>复制链接</h3>
+        <p>在 TikTok 或抖音 App / 网页中打开目标视频，点击分享，复制视频链接。</p>
+      </div>
+      <div class="step">
+        <div class="num">2</div>
+        <h3>粘贴解析</h3>
+        <p>把链接粘贴到上方输入框，点击「解析视频」，稍等几秒自动提取无水印视频。</p>
+      </div>
+      <div class="step">
+        <div class="num">3</div>
+        <h3>下载保存</h3>
+        <p>点击「下载无水印视频」或「新窗口打开原视频」，即可保存到本地。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 网页版 vs 插件版 ===== -->
+  <section class="compare">
+    <div class="sec-head">
+      <div class="tag">CHOOSE YOUR WAY</div>
+      <h2>网页版 vs 浏览器插件版</h2>
+    </div>
+    <div class="cols">
+
+      <div class="cbox web">
+        <div class="chead">
+          <div class="ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>
+          </div>
+          <div>
+            <b>网页版</b>
+            <small>你现在正在使用的</small>
+          </div>
+        </div>
+        <ul>
+          <li class="good"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>无需安装，浏览器打开即用，任何设备（电脑 / 手机）都能访问</span></li>
+          <li class="bad"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg><span><b>只能单个</b>复制粘贴链接，逐个解析下载，不支持批量</span></li>
+          <li class="bad"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg><span>不能自动识别页面里的视频，需要手动复制链接</span></li>
+          <li class="bad"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg><span>依赖第三方解析接口，受网络 / 跨域限制，个别视频可能解析失败</span></li>
+          <li class="bad"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg><span>无下载历史、无主题切换等扩展功能</span></li>
+        </ul>
+        <div class="ft">适合临时用一下、不方便安装扩展的场景。</div>
+      </div>
+
+      <div class="cbox plug">
+        <div class="chead">
+          <div class="ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M9 3v4m6-4v4M5 7h14v3a7 7 0 0 1-14 0V7zM12 14v5m0 0h-3m3 0h3"/></svg>
+          </div>
+          <div>
+            <b>浏览器插件版</b>
+            <small>Chrome 扩展 · 功能完整</small>
+          </div>
+        </div>
+        <ul>
+          <li class="good"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>自动拦截</b>页面视频请求，在浏览 TikTok / 抖音时自动出现下载按钮</span></li>
+          <li class="good"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>批量下载</b>：可一次下载推荐页全部视频 / 当前页全部视频</span></li>
+          <li class="good"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>多重解析</b>：本地拦截 + 6 种深度解析 + 页面抓取，成功率更高</span></li>
+          <li class="good"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>快捷键</b> Ctrl+Shift+D 一键下载，支持右键菜单、下载历史、进度条、独立窗口、主题切换</span></li>
+          <li class="good"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span><b>100% 免费</b>，无限下载，无试用、无激活码、无每日限额</span></li>
+        </ul>
+        <div class="ft">功能完整、体验最佳。源码与安装方法见 <a href="https://github.com/xzzz0371-maker/tiktok-downloader-v3" target="_blank" rel="noopener">GitHub 仓库</a>。</div>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="flinks">
+    <a href="https://github.com/xzzz0371-maker/tiktok-downloader-v3" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.6.5.5 5.6.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.8 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 5 18.3 5.3 18.3 5.3c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.5-2.7 5.5-5.3 5.8.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A11.5 11.5 0 0 0 23.5 12C23.5 5.6 18.4.5 12 .5z"/></svg>
+      GitHub · xzzz0371-maker
+    </a>
+    <a href="#top">返回顶部</a>
+  </div>
+  <p class="disc">
+    本工具仅用于个人学习、备份与合理使用，请尊重创作者版权并遵守平台规则。视频版权归原作者所有，请勿用于商业用途或传播侵权内容。网页版解析依赖第三方公开接口，不保证 100% 可用。
+  </p>
+</footer>
+
+<script>
+(function(){
+  'use strict';
+
+  var input  = document.getElementById('urlInput');
+  var btn    = document.getElementById('parseBtn');
+  var status = document.getElementById('status');
+  var resBox = document.getElementById('result');
+  var vCover = document.getElementById('vCover');
+  var vPlayer= document.getElementById('vPlayer');
+  var vPlayBtn= document.getElementById('vPlayBtn');
+  var vWmark = document.getElementById('vWmark');
+  var vDur   = document.getElementById('vDur');
+  var vAuthor= document.getElementById('vAuthor');
+  var vTitle = document.getElementById('vTitle');
+  var vSource= document.getElementById('vSource');
+  var vDl    = document.getElementById('vDownload');
+  var vOpen  = document.getElementById('vOpen');
+
+  var PROXIES = [
+    function(u){ return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u); },
+    function(u){ return 'https://corsproxy.io/?url=' + encodeURIComponent(u); }
+  ];
+
+  var SOURCES = [
+    { name:'tikwm.com',    build:function(u){ return 'https://www.tikwm.com/api/?url=' + encodeURIComponent(u); }, parse:parseTikwm },
+    { name:'api.tikwm.com',build:function(u){ return 'https://api.tikwm.com/api/?url=' + encodeURIComponent(u); }, parse:parseTikwm },
+    { name:'tikwm.one',    build:function(u){ return 'https://www.tikwm.one/api/?url=' + encodeURIComponent(u); }, parse:parseTikwm },
+    { name:'api.tikwm.one',build:function(u){ return 'https://api.tikwm.one/api/?url=' + encodeURIComponent(u); }, parse:parseTikwm },
+    { name:'douyin.wtf',   build:function(u){ return 'https://api.douyin.wtf/api/?url=' + encodeURIComponent(u); }, parse:parseTikwm },
+    { name:'tiklydown',    build:function(u){ return 'https://api.tiklydown.eu.org/api/download?url=' + encodeURIComponent(u); }, parse:parseTiklydown }
+  ];
+
+  function fetchText(url, timeout){
+    var ctrl = new AbortController();
+    var t = setTimeout(function(){ ctrl.abort(); }, timeout || 12000);
+    return fetch(url, { signal:ctrl.signal, headers:{ 'Accept':'application/json,text/html,*/*' } })
+      .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
+      .finally(function(){ clearTimeout(t); });
+  }
+
+  function un(s){
+    return String(s||'').replace(/\\u002F/g,'/').replace(/\\\//g,'/').replace(/\\u0026/g,'&').replace(/\\u0022/g,'"');
+  }
+
+  function esc(s){
+    return String(s||'').replace(/[&<>"']/g, function(c){
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  }
+
+  function parseTikwm(txt){
+    var j; try { j = JSON.parse(txt); } catch(e){ return null; }
+    if(!j || (j.code !== undefined && j.code !== 0) || !j.data) return null;
+    var d = j.data;
+    var play = d.hdplay || d.play || '';
+    if(!play) return null;
+    return {
+      videoUrl: un(play),
+      cover: un(d.cover || d.origin_cover || ''),
+      title: un(d.title || ''),
+      author: (d.author && d.author.nickname) || d.nickname || '',
+      duration: parseInt(d.duration,10) || 0
+    };
+  }
+
+  function parseTiklydown(txt){
+    var j; try { j = JSON.parse(txt); } catch(e){ return null; }
+    if(!j || j.success === false) return null;
+    var r = j.result || {};
+    var play = r.video1 || r.video2 || r.video || '';
+    if(!play) return null;
+    return {
+      videoUrl: un(play),
+      cover: un(r.thumbnail || ''),
+      title: un(r.title || ''),
+      author: un(r.author || ''),
+      duration: parseInt(r.duration,10) || 0
+    };
+  }
+
+  function pickUrl(raw){
+    var m = raw.match(/https?:\/\/[^\s"'<>]+/i) || raw.match(/(?:tiktok\.com|douyin\.com)\S*/i);
+    if(!m) return null;
+    var u = m[0].replace(/[),.;，。、]+$/,'');
+    if(!/^https?:/i.test(u)) u = 'https://' + u;
+    return u;
+  }
+
+  function extractFromHtml(html){
+    var h = un(html);
+    var found = [];
+    var re, m;
+    re = /"hdplay"\s*:\s*"([^"]+)"/g; while((m=re.exec(h))) found.push(m[1]);
+    re = /"playAddr"\s*:\s*"([^"]+)"/g; while((m=re.exec(h))) found.push(m[1]);
+    re = /https?:\\?\/\\?\/[^"\s]+\.(?:mp4|m3u8)[^"\s]*/g; while((m=re.exec(h))) found.push(m[1]);
+    found = found.filter(function(u){ return !/apk_new|desktop_videos|download\/apk|ads|promotion/i.test(u); });
+    if(!found.length) return null;
+    var dedup = found.filter(function(v,i){ return found.indexOf(v)===i; });
+    var pick = dedup.filter(function(u){ return /playwm/i.test(u) ? false : true; })[0] || dedup[0];
+    if(!pick) return null;
+    var title = (h.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/)||[])[1] || '';
+    var cover = (h.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/)||[])[1] || '';
+    var desc  = (h.match(/<meta[^>]+property="og:description"[^>]+content="([^"]+)"/)||[])[1] || '';
+    var author = (desc.match(/@([A-Za-z0-9_.]+)/)||[])[1] || '';
+    return { videoUrl: un(pick), cover: un(cover), title: un(title), author: author, duration:0 };
+  }
+
+  async function parseViaPage(finalUrl){
+    for(var i=0;i<PROXIES.length;i++){
+      try{
+        var html = await fetchText(PROXIES[i](finalUrl), 16000);
+        var v = extractFromHtml(html);
+        if(v && v.videoUrl) return v;
+      }catch(e){ /* try next proxy */ }
+    }
+    return null;
+  }
+
+  async function resolve(url){
+    for(var i=0;i<SOURCES.length;i++){
+      try{
+        var txt = await fetchText(SOURCES[i].build(url));
+        var v = SOURCES[i].parse(txt);
+        if(v && v.videoUrl){ v.source = SOURCES[i].name; return v; }
+      }catch(e){ /* try next source */ }
+    }
+    var page = await parseViaPage(url);
+    if(page && page.videoUrl){ page.source = '页面解析'; return page; }
+    return null;
+  }
+
+  function fmtDur(s){
+    if(!s || isNaN(s) || s<=0) return '';
+    var m = Math.floor(s/60), sec = Math.floor(s%60);
+    return m + ':' + (sec<10?'0':'') + sec;
+  }
+
+  // 标题：普通文字转义，#话题 高亮为标签
+  function renderTitle(t){
+    if(!t) return '';
+    var parts = String(t).split(/(#[A-Za-z0-9_\u4e00-\u9fa5]+)/g);
+    var out = '';
+    for(var i=0;i<parts.length;i++){
+      var p = parts[i];
+      if(!p) continue;
+      if(/^#/.test(p)){ out += '<span class="htag">' + esc(p) + '</span>'; }
+      else{ out += esc(p); }
+    }
+    return out;
+  }
+
+  function setStatus(msg, isErr){
+    status.className = 'status show' + (isErr ? ' err' : '');
+    status.innerHTML = '';
+    if(!isErr){
+      var sp = document.createElement('span'); sp.className='spin';
+      status.appendChild(sp);
+    }
+    status.appendChild(document.createTextNode(msg));
+  }
+
+  function hideStatus(){ status.className='status'; status.innerHTML=''; }
+
+  function showResult(v){
+    vCover.hidden = !v.cover;
+    if(v.cover) vCover.src = v.cover;
+    vPlayer.pause();
+    vPlayer.removeAttribute('src');
+    vPlayer.load();
+    vPlayer.hidden = true;
+    vPlayBtn.hidden = !v.cover;
+    vWmark.hidden = false;
+    vDur.hidden = !fmtDur(v.duration);
+    if(fmtDur(v.duration)) vDur.textContent = fmtDur(v.duration);
+    vAuthor.textContent = v.author || '未知作者';
+    vTitle.innerHTML = renderTitle(v.title || '（无标题）');
+    vSource.textContent = '来源：' + v.source;
+    vDl.href = v.videoUrl;
+    vDl.setAttribute('download','');
+    vOpen.href = v.videoUrl;
+    resBox.classList.add('show');
+  }
+
+  vPlayBtn.addEventListener('click', function(){
+    var src = vDl.getAttribute('href') || vDl.href;
+    if(!src) return;
+    vPlayer.src = src;
+    vCover.hidden = true;
+    vPlayBtn.hidden = true;
+    vWmark.hidden = true;
+    vPlayer.hidden = false;
+    vPlayer.play().catch(function(){ /* 自动播放被拦截时等待用户手动播放 */ });
+  });
+
+  vPlayer.addEventListener('ended', function(){
+    vPlayer.hidden = true;
+    vPlayer.pause();
+    vPlayer.removeAttribute('src');
+    vPlayer.load();
+    vCover.hidden = false;
+    vPlayBtn.hidden = false;
+    vWmark.hidden = false;
+  });
+
+  function setBusy(busy){
+    btn.disabled = busy;
+    btn.innerHTML = busy
+      ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9"/></svg>解析中…'
+      : '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5-11-6.5z"/></svg>解析视频';
+  }
+
+  function parse(){
+    var raw = input.value.trim();
+    if(!raw){ setStatus('请先粘贴一个视频链接', true); return; }
+    var url = pickUrl(raw);
+    if(!url){ setStatus('未识别到 TikTok 或抖音链接，请检查链接格式', true); return; }
+
+    setBusy(true);
+    hideStatus();
+    setStatus('正在解析，请稍候…');
+
+    resolve(url).then(function(v){
+      setBusy(false);
+      if(v){
+        hideStatus();
+        showResult(v);
+      }else{
+        setStatus('解析失败：请确认链接有效、可公开访问，稍后重试', true);
+      }
+    }).catch(function(){
+      setBusy(false);
+      setStatus('解析出错：网络异常，请检查网络后重试', true);
+    });
+  }
+
+  btn.addEventListener('click', parse);
+  input.addEventListener('keydown', function(e){ if(e.key==='Enter') parse(); });
+})();
+</script>
+</body>
+</html>
