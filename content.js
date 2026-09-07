@@ -8,7 +8,7 @@ let isEnabled = true;
 // 从 chrome.storage 读取开关状态
 chrome.storage.local.get('recommendAutoParse', (result) => {
   isEnabled = result.recommendAutoParse !== false; // 默认开启
-  if (isEnabled && isRecommendPage()) {
+  if (isEnabled && isAutoParsePage()) {
     initObserver();
   }
 });
@@ -17,7 +17,7 @@ chrome.storage.local.get('recommendAutoParse', (result) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.recommendAutoParse) {
     isEnabled = changes.recommendAutoParse.newValue !== false;
-    if (isEnabled && isRecommendPage() && !observer) {
+    if (isEnabled && isAutoParsePage() && !observer) {
       initObserver();
     } else if (!isEnabled && observer) {
       observer.disconnect();
@@ -26,18 +26,23 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-// 判断当前页面是否为推荐页
-function isRecommendPage() {
+// 判断当前页面是否可自动解析（推荐页 / 搜索页 / 标签页 / 用户主页）
+function isAutoParsePage() {
   const host = location.hostname;
   if (!host.includes('tiktok.com') && !host.includes('douyin.com')) return false;
   const path = location.pathname;
-  // TikTok 推荐页：/、/foryou、/en/、/en/foryou 等
+  // TikTok：推荐页（/、/foryou、区域页）+ 搜索页 + 标签页 + 用户主页
   if (host.includes('tiktok.com')) {
-    return /^\/(?:[a-z]{2}\/)?(?:foryou)?$/.test(path);
+    return /^\/(?:[a-z]{2}\/)?(?:foryou)?$/.test(path)
+        || path.startsWith('/search')
+        || path.startsWith('/tag/')
+        || path.startsWith('/@');
   }
-  // 抖音首页
+  // 抖音：首页 + 搜索页 + 用户主页
   if (host.includes('douyin.com')) {
-    return path === '/' || path === '' || /^\/(?:[a-z]{2}\/)?$/.test(path);
+    return path === '/' || path === '' || /^\/(?:[a-z]{2}\/)?$/.test(path)
+        || path.startsWith('/search')
+        || path.startsWith('/user/');
   }
   return false;
 }
@@ -109,7 +114,7 @@ function getCurrentVideoInfo() {
 
 // DOM 变动回调
 function onDomMutate() {
-  if (!isEnabled || !isRecommendPage()) return;
+  if (!isEnabled || !isAutoParsePage()) return;
   const info = getCurrentVideoInfo();
   if (!info?.videoId) return;
   if (info.videoId === lastParsedVideoId) return;

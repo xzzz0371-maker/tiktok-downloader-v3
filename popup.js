@@ -861,6 +861,38 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (e) {}
   }, 400);
 
+  // ===== 共享：自动解析目标判定（视频页/推荐页/搜索页/标签页/用户主页） =====
+  async function getAutoParseTarget(tab) {
+    const url = (tab && tab.url) || '';
+    if (!url) return '';
+    if (!/tiktok\.com|douyin\.com|iesdouyin\.com|tiktokv\.com/.test(url)) return '';
+    // 视频详情页 / 短链：直接用页面 URL
+    if (/\/video\/\d+|\/v\/\d+|v\.douyin\.com|vm\.tiktok\.com/.test(url)) return url;
+    // 搜索页 / 标签页 / 用户主页 / 推荐页 / 首页：提取视口内第一个视频链接
+    if (/\/search|\/tag\/|\/@|foryou|^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)|^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)|^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url)) {
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => {
+            const links = Array.from(document.querySelectorAll('a[href*="/video/"]'));
+            for (const a of links) {
+              const r = a.getBoundingClientRect();
+              if (r.width > 0 && r.bottom > 0 && r.top < window.innerHeight) {
+                const m1 = a.href.match(/\/@([^\/?]+)\/video\/(\d+)/);
+                if (m1) return 'https://www.tiktok.com/@' + m1[1] + '/video/' + m1[2];
+                const m2 = a.href.match(/\/video\/(\d+)/);
+                if (m2) return 'https://www.tiktok.com/video/' + m2[1];
+              }
+            }
+            return '';
+          }
+        });
+        return (res && res[0] && res[0].result) || '';
+      } catch (e) { return ''; }
+    }
+    return '';
+  }
+
   // ===== 独立窗口模式：自动解析切换后的视频 =====
   const isWindowMode = new URLSearchParams(window.location.search).get('window') === '1';
   if (isWindowMode) {
@@ -888,22 +920,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       try {
         // 独立窗口模式下 currentWindow 是 popup 自己，所以查询所有窗口的活动标签页
         const tabs = await chrome.tabs.query({ active: true });
-        // 只匹配视频详情页和首页/推荐页，排除搜索页/用户主页
-        const videoTab = tabs.find(t => {
-          const u = t.url || '';
-          return u.includes('/video/') || u.includes('/v/') || u.includes('v.douyin.com')
-              || /^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)/.test(u)
-              || /^https?:\/\/(www\.)?tiktok\.com\/foryou\/?(\?|$)/.test(u)
-              || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)/.test(u)
-              || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/foryou\/?(\?|$)/.test(u)
-              || /^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(u);
-        });
-        const url = videoTab?.url || '';
-        if (!url) return;
-        if (url !== lastAutoParsedUrl) {
-          lastAutoParsedUrl = url;
-          urlInput.value = url;
-          handleParse(false); // 解析中也提交，后台会排队
+        for (const t of tabs) {
+          const target = await getAutoParseTarget(t);
+          if (target && target !== lastAutoParsedUrl) {
+            lastAutoParsedUrl = target;
+            urlInput.value = target;
+            handleParse(false); // 解析中也提交，后台会排队
+            break;
+          }
         }
       } catch (e) {}
     }
@@ -941,18 +965,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       try {
         // 侧边栏在浏览器窗口内，currentWindow 是正确的
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-        const url = tabs?.[0]?.url || '';
-        if (!url) return;
-        // 只匹配视频详情页和首页/推荐页，排除搜索页/用户主页
-        const isVideoPage = url.includes('/video/') || url.includes('/v/') || url.includes('v.douyin.com')
-                        || /^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)/.test(url)
-                        || /^https?:\/\/(www\.)?tiktok\.com\/foryou\/?(\?|$)/.test(url)
-                        || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)/.test(url)
-                        || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/foryou\/?(\?|$)/.test(url)
-                        || /^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url);
-        if (isVideoPage && url !== lastAutoParsedUrl) {
-          lastAutoParsedUrl = url;
-          urlInput.value = url;
+        const tab = tabs?.[0];
+        const target = await getAutoParseTarget(tab);
+        if (target && target !== lastAutoParsedUrl) {
+          lastAutoParsedUrl = target;
+          urlInput.value = target;
           handleParse(false);
         }
       } catch (e) {}
