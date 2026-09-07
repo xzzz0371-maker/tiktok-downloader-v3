@@ -153,6 +153,9 @@ function renderCard(video, index) {
   const likesLabel = video.likes ? `❤️ ${escapeHtml(video.likes)}` : '';
   const dateLabel = video.createTime ? `📅 ${escapeHtml(video.createTime)}` : '';
   const sourceLabel = getSourceLabel(video._parseSource);
+  const qualityLabel = (video.type === 'photo' || (video.images && video.images.length))
+    ? '🖼 图集 ' + (video.images ? video.images.length : 0) + ' 张'
+    : (video.quality || '高清');
 
   card.innerHTML = `
     <div class="cover" data-preview="${index}" style="cursor:pointer;">
@@ -165,7 +168,7 @@ function renderCard(video, index) {
       <div class="title" data-preview="${index}" title="${safeTitle}">${safeTitle}</div>
       <div class="meta">
         <span class="author">👤 ${safeAuthor}</span>
-        <span class="quality">${escapeHtml(video.quality || '高清')}</span>
+        <span class="quality">${escapeHtml(qualityLabel)}</span>
         ${langLabel ? `<span>${langLabel}</span>` : ''}
         ${likesLabel ? `<span>${likesLabel}</span>` : ''}
         ${dateLabel ? `<span>${dateLabel}</span>` : ''}

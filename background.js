@@ -7,6 +7,9 @@ import { formatLikes, formatDate } from './common.js';
 
 const API_TIMEOUT = 10000;
 const DOWNLOAD_TIMEOUT = 120000; // 下载超时延长到 120 秒
+// 自建解析后端（Cloudflare Pages 同域部署，国内可达；海外边缘多源轮询 + 页面直抓）
+const OWN_PARSE_API = 'https://tiktok-downloader-av8.pages.dev/api/parse';
+const OWN_PARSE_TOKEN = 'tdp2026x7kq9mz3vn8clw4r';
 
 // ---------- 工具函数 ----------
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -1073,6 +1076,33 @@ async function parseViaIntercept(finalUrl) {
   ]);
 }
 
+
+async function parseViaOwnBackend(finalUrl) {
+  const resp = await fetchWithTimeout(OWN_PARSE_API + '?url=' + encodeURIComponent(finalUrl) + '&token=' + OWN_PARSE_TOKEN, {}, 12000);
+  if (!resp.ok) throw new Error('backend HTTP ' + resp.status);
+  const d = await resp.json();
+  if (!d || !d.success) throw new Error((d && d.error) || 'backend parse failed');
+  return {
+    success: true,
+    originalUrl: finalUrl,
+    id: d.id || Date.now(),
+    title: d.title || '无标题',
+    author: d.author || '未知作者',
+    authorAvatar: d.authorAvatar || '',
+    cover: d.cover || '',
+    videoUrl: d.videoUrl || '',
+    hdVideoUrl: d.hdVideoUrl || d.videoUrl || '',
+    images: Array.isArray(d.images) ? d.images : [],
+    type: d.type || 'video',
+    duration: d.duration || 0,
+    quality: (d.source === 'page') ? '原画质' : '高清',
+    language: '',
+    likes: d.likes || '',
+    createTime: d.createTime || '',
+    _parseSource: 'own_backend'
+  };
+}
+
 async function parseVideo(url) {
   let finalUrl = url.trim();
 
@@ -1096,6 +1126,13 @@ async function parseVideo(url) {
   // ===== 并行解析：本地拦截 + 页面深度解析 + Fetch HTML + 前3个API =====
   // 谁先成功用谁的，大幅提升速度和成功率
   const sources = [];
+
+  // 源0：自建解析后端（海外边缘多源轮询，国内可达）
+  sources.push(parseViaOwnBackend(finalUrl).then(r => {
+    r.originalUrl = finalUrl;
+    enrichVideoAsync(r);
+    return r;
+  }).catch(e => { throw e; }));
 
   // 源1：本地拦截（3秒超时，快速失败）
   sources.push(parseViaIntercept(finalUrl).catch(e => { throw e; }));
@@ -1392,8 +1429,43 @@ function translateDownloadError(errorCode) {
 // ============================================================
 //  模块九：下载核心（优化版）
 // ============================================================
+
+// ---------- 图集下载：逐张下载图片 ----------
+async function downloadPhotoImages(video, language = '') {
+  const images = (Array.isArray(video.images) ? video.images : []).filter(u => u && /^https?:/.test(u));
+  if (!images.length) return { success: false, error: '无图片链接' };
+  let safeAuthor = (video.author || 'unknown').replace(/[\\/:*?"<>|]/g, '_');
+  if (safeAuthor.length > 50) safeAuthor = safeAuthor.substring(0, 50);
+  const dateStr = video.createTime ? String(video.createTime).replace(/[^\d.]/g, '') : '';
+  const base = [video.likes, dateStr, safeAuthor].filter(Boolean).join('_') || 'tiktok_photo';
+  let ok = 0;
+  for (let i = 0; i < images.length; i++) {
+    const m = images[i].match(/\.(png|jpe?g|webp)/i);
+    const ext = m ? (m[1].toLowerCase() === 'jpeg' ? 'jpg' : m[1].toLowerCase()) : 'jpg';
+    const filename = base + '_photo_' + String(i + 1).padStart(2, '0') + '.' + ext;
+    try {
+      const id = await new Promise((resolve) => {
+        chrome.downloads.download({ url: images[i], filename, saveAs: false }, (did) => {
+          if (chrome.runtime.lastError) resolve(null); else resolve(did);
+        });
+      });
+      if (id) {
+        ok++;
+        updateDownloadProgress(id, { videoId: video.id, filename, state: 'in_progress', bytesReceived: 0, totalBytes: 0, startTime: Date.now() });
+      }
+    } catch (e) {}
+  }
+  if (ok > 0) await recordDownloadedVideo(video.id);
+  return ok === images.length
+    ? { success: true, url: images[0] }
+    : { success: ok > 0, error: '图集下载 ' + ok + '/' + images.length + ' 张成功', url: images[0] };
+}
 async function downloadSingleVideo(video, language = '') {
   const url = (video.hdVideoUrl || video.videoUrl || '').trim();
+  // 图集：无视频链接但有图片列表 → 逐张下载图片
+  if (!url && Array.isArray(video.images) && video.images.length) {
+    return downloadPhotoImages(video, language);
+  }
   if (!url) return { success: false, error: '无视频链接', url: null };
 
   // 构造文件名（点赞和日期放最前面）
@@ -1512,6 +1584,21 @@ async function downloadSingleVideo(video, language = '') {
 
   if (result.success) {
     await recordDownloadedVideo(video.id);
+    return { ...result, url };
+  }
+
+  // 失败重试：TikTok CDN 间歇风控（数据中心 IP）→ 重新解析拿新签名链接再下（仅一次）
+  if (!video._retried && video.originalUrl) {
+    try {
+      const re = await parseVideo(video.originalUrl);
+      if (re && re.success) {
+        const newUrl = (re.hdVideoUrl || re.videoUrl || '').trim();
+        if (newUrl && newUrl !== url) {
+          console.log('[下载] 原链接被拒，重新解析成功，换新链接重试');
+          return downloadSingleVideo({ ...video, videoUrl: newUrl, hdVideoUrl: newUrl, _retried: true }, language);
+        }
+      }
+    } catch (e) {}
   }
   return { ...result, url };
 }
