@@ -385,7 +385,7 @@ async function clearHistory() {
   await chrome.storage.local.remove('downloadedIds');
   downloadedIds = new Set();
   updateHistoryToolbar();
-  refreshVideoList();
+  updateDownloadedBadges();
   showToast('✅ 下载历史已清空');
 }
 

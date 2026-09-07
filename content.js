@@ -91,6 +91,22 @@ function getCurrentPlayingVideoId() {
   return null;
 }
 
+// 获取当前视频信息（videoId + 作者），供推荐页自动解析与"当前页"抓取使用
+function getCurrentVideoInfo() {
+  const videoId = getCurrentPlayingVideoId();
+  if (!videoId) return null;
+  // 从页面中查找作者信息（链接格式 /@username/video/xxx）
+  let author = '';
+  const links = document.querySelectorAll('a[href*="/video/"]');
+  for (const link of links) {
+    if (link.href && link.href.includes('/video/' + videoId)) {
+      const m = link.href.match(/\/@([^\/?]+)\//);
+      if (m) { author = m[1]; break; }
+    }
+  }
+  return { videoId, author };
+}
+
 // DOM 变动回调
 function onDomMutate() {
   if (!isEnabled || !isRecommendPage()) return;

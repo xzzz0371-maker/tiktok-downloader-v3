@@ -10,6 +10,8 @@ const DOWNLOAD_TIMEOUT = 120000; // 下载超时延长到 120 秒
 // 自建解析后端（Cloudflare Pages 同域部署，国内可达；海外边缘多源轮询 + 页面直抓）
 const OWN_PARSE_API = 'https://tiktok-downloader-av8.pages.dev/api/parse';
 const OWN_PARSE_TOKEN = 'tdp2026x7kq9mz3vn8clw4r';
+// 自建下载代理（服务器带 Cookie+Referer 拉流，直连被拒时的兜底通道）
+const OWN_PROXY_API = 'https://tiktok-downloader-av8.pages.dev/api/proxy?url=';
 
 // ---------- 工具函数 ----------
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -1444,11 +1446,19 @@ async function downloadPhotoImages(video, language = '') {
     const ext = m ? (m[1].toLowerCase() === 'jpeg' ? 'jpg' : m[1].toLowerCase()) : 'jpg';
     const filename = base + '_photo_' + String(i + 1).padStart(2, '0') + '.' + ext;
     try {
-      const id = await new Promise((resolve) => {
+      // 直连下载；被拒时（CDN 校验严格域）自动改走自建代理
+      let id = await new Promise((resolve) => {
         chrome.downloads.download({ url: images[i], filename, saveAs: false }, (did) => {
           if (chrome.runtime.lastError) resolve(null); else resolve(did);
         });
       });
+      if (!id) {
+        id = await new Promise((resolve) => {
+          chrome.downloads.download({ url: OWN_PROXY_API + encodeURIComponent(images[i]), filename, saveAs: false }, (did) => {
+            if (chrome.runtime.lastError) resolve(null); else resolve(did);
+          });
+        });
+      }
       if (id) {
         ok++;
         updateDownloadProgress(id, { videoId: video.id, filename, state: 'in_progress', bytesReceived: 0, totalBytes: 0, startTime: Date.now() });
@@ -1485,121 +1495,123 @@ async function downloadSingleVideo(video, language = '') {
     nameBody = safeTitle;
   }
   const filename = `${nameBody}.mp4`;
-  console.log(`[下载] 开始: ${filename}`);
 
-  // 创建下载
-  let downloadId;
-  try {
-    downloadId = await new Promise((resolve) => {
-      chrome.downloads.download({ url, filename, saveAs: false }, (id) => {
-        if (chrome.runtime.lastError) {
-          console.warn('[下载] 创建失败:', chrome.runtime.lastError.message);
-          resolve(null);
-        } else resolve(id);
-      });
-    });
-  } catch (e) {
-    return { success: false, error: 'API异常: ' + e.message, url };
-  }
-
-  if (!downloadId) {
-    return { success: false, error: '下载创建失败（URL无效或被阻止）', url };
-  }
-
-  // 初始化进度
-  updateDownloadProgress(downloadId, {
-    videoId: video.id, filename, state: 'in_progress',
-    bytesReceived: 0, totalBytes: 0, startTime: Date.now()
-  });
-
-  // 监听下载变化
-  const result = await new Promise((resolve) => {
-    let settled = false;
-
-    const listener = (delta) => {
-      if (delta.id !== downloadId || settled) return;
-
-      // 进度更新（含速度计算）
-      if (delta.bytesReceived || delta.totalBytes) {
-        const cur = downloadProgressMap.get(downloadId) || {};
-        const newBytes = delta.bytesReceived?.current ?? cur.bytesReceived ?? 0;
-        const now = Date.now();
-        // 计算速度：与上次记录的差值 / 时间差
-        let speed = cur.speed || 0;
-        if (cur.lastBytes && cur.lastTime && newBytes > cur.lastBytes) {
-          const elapsed = (now - cur.lastTime) / 1000;
-          if (elapsed > 0) {
-            const instantSpeed = (newBytes - cur.lastBytes) / elapsed;
-            // 平滑处理：新速度占30%，旧速度占70%，避免抖动
-            speed = cur.speed ? cur.speed * 0.7 + instantSpeed * 0.3 : instantSpeed;
-          }
-        }
-        updateDownloadProgress(downloadId, {
-          bytesReceived: newBytes,
-          totalBytes: delta.totalBytes?.current ?? cur.totalBytes ?? 0,
-          speed,
-          lastBytes: newBytes,
-          lastTime: now
+  // ---------- 单次下载（直连 URL 或代理 URL） ----------
+  function runDownload(dlUrl) {
+    const viaProxy = dlUrl.startsWith(OWN_PROXY_API);
+    console.log(`[下载] ${viaProxy ? '代理' : '直连'}: ${filename}`);
+    return new Promise(async (resolve) => {
+      let downloadId;
+      try {
+        downloadId = await new Promise((resolve) => {
+          chrome.downloads.download({ url: dlUrl, filename, saveAs: false }, (id) => {
+            if (chrome.runtime.lastError) {
+              console.warn('[下载] 创建失败:', chrome.runtime.lastError.message);
+              resolve(null);
+            } else resolve(id);
+          });
         });
+      } catch (e) {
+        resolve({ success: false, error: 'API异常: ' + e.message, url: dlUrl });
+        return;
       }
-
-      // 完成
-      if (delta.state?.current === 'complete') {
-        settled = true;
-        chrome.downloads.onChanged.removeListener(listener);
-        updateDownloadProgress(downloadId, { state: 'complete', bytesReceived: delta.bytesReceived?.current ?? 0 });
-        console.log(`[下载] 完成: ${filename}`);
-        // 延迟清理，让 popup 有机会显示完成状态
-        setTimeout(() => removeDownloadProgress(downloadId), 5000);
-        resolve({ success: true });
+      if (!downloadId) {
+        resolve({ success: false, error: '下载创建失败（URL无效或被阻止）', url: dlUrl });
+        return;
       }
-
-      // 错误
-      if (delta.error?.current) {
-        settled = true;
-        chrome.downloads.onChanged.removeListener(listener);
-        const errMsg = translateDownloadError(delta.error.current);
-        updateDownloadProgress(downloadId, { state: 'error', error: errMsg });
-        setTimeout(() => removeDownloadProgress(downloadId), 8000);
-        console.warn(`[下载] 错误: ${errMsg}`);
-        resolve({ success: false, error: errMsg });
-      }
-    };
-
-    chrome.downloads.onChanged.addListener(listener);
-
-    // 超时：取消下载并清理
-    setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      chrome.downloads.onChanged.removeListener(listener);
-      chrome.downloads.cancel(downloadId, () => {
-        // 忽略 cancel 的错误（可能已经完成）
+      updateDownloadProgress(downloadId, {
+        videoId: video.id, filename, state: 'in_progress',
+        bytesReceived: 0, totalBytes: 0, startTime: Date.now()
       });
-      updateDownloadProgress(downloadId, { state: 'error', error: '下载超时（已取消）' });
-      setTimeout(() => removeDownloadProgress(downloadId), 8000);
-      resolve({ success: false, error: '下载超时' });
-    }, DOWNLOAD_TIMEOUT);
-  });
+      let settled = false;
+      const listener = (delta) => {
+        if (delta.id !== downloadId || settled) return;
+        if (delta.bytesReceived || delta.totalBytes) {
+          const cur = downloadProgressMap.get(downloadId) || {};
+          const newBytes = delta.bytesReceived?.current ?? cur.bytesReceived ?? 0;
+          const now = Date.now();
+          let speed = cur.speed || 0;
+          if (cur.lastBytes && cur.lastTime && newBytes > cur.lastBytes) {
+            const elapsed = (now - cur.lastTime) / 1000;
+            if (elapsed > 0) {
+              const instantSpeed = (newBytes - cur.lastBytes) / elapsed;
+              speed = cur.speed ? cur.speed * 0.7 + instantSpeed * 0.3 : instantSpeed;
+            }
+          }
+          updateDownloadProgress(downloadId, {
+            bytesReceived: newBytes,
+            totalBytes: delta.totalBytes?.current ?? cur.totalBytes ?? 0,
+            speed, lastBytes: newBytes, lastTime: now
+          });
+        }
+        if (delta.state?.current === 'complete') {
+          settled = true;
+          chrome.downloads.onChanged.removeListener(listener);
+          updateDownloadProgress(downloadId, { state: 'complete', bytesReceived: delta.bytesReceived?.current ?? 0 });
+          console.log(`[下载] 完成: ${filename}`);
+          setTimeout(() => removeDownloadProgress(downloadId), 5000);
+          resolve({ success: true });
+        }
+        if (delta.error?.current) {
+          settled = true;
+          chrome.downloads.onChanged.removeListener(listener);
+          const errMsg = translateDownloadError(delta.error.current);
+          updateDownloadProgress(downloadId, { state: 'error', error: errMsg });
+          setTimeout(() => removeDownloadProgress(downloadId), 8000);
+          console.warn(`[下载] 错误: ${errMsg}`);
+          resolve({ success: false, error: errMsg });
+        }
+      };
+      chrome.downloads.onChanged.addListener(listener);
+      setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        chrome.downloads.onChanged.removeListener(listener);
+        chrome.downloads.cancel(downloadId, () => {});
+        updateDownloadProgress(downloadId, { state: 'error', error: '下载超时（已取消）' });
+        setTimeout(() => removeDownloadProgress(downloadId), 8000);
+        resolve({ success: false, error: '下载超时' });
+      }, DOWNLOAD_TIMEOUT);
+    });
+  }
 
+  // 尝试1：直连 CDN（用户住宅 IP 多数可直接下载）
+  let result = await runDownload(url);
   if (result.success) {
     await recordDownloadedVideo(video.id);
     return { ...result, url };
   }
 
-  // 失败重试：TikTok CDN 间歇风控（数据中心 IP）→ 重新解析拿新签名链接再下（仅一次）
+  // 尝试2：重新解析拿新签名链接再直连（仅一次，防递归）
   if (!video._retried && video.originalUrl) {
     try {
       const re = await parseVideo(video.originalUrl);
       if (re && re.success) {
         const newUrl = (re.hdVideoUrl || re.videoUrl || '').trim();
         if (newUrl && newUrl !== url) {
-          console.log('[下载] 原链接被拒，重新解析成功，换新链接重试');
-          return downloadSingleVideo({ ...video, videoUrl: newUrl, hdVideoUrl: newUrl, _retried: true }, language);
+          console.log('[下载] 直连被拒，重新解析成功，换新链接重试');
+          const r2 = await runDownload(newUrl);
+          if (r2.success) {
+            await recordDownloadedVideo(video.id);
+            return { ...r2, url: newUrl };
+          }
         }
       }
     } catch (e) {}
   }
+
+  // 尝试3：自建代理兜底（服务器带 Cookie+Referer 拉流，直连/换链均被拒时成功率高）
+  if (!video._proxyTried) {
+    const proxyUrl = OWN_PROXY_API + encodeURIComponent(url);
+    console.log('[下载] 直连失败，改走自建代理');
+    const r3 = await runDownload(proxyUrl);
+    if (r3.success) {
+      await recordDownloadedVideo(video.id);
+      return { ...r3, url: proxyUrl, viaProxy: true };
+    }
+    return { ...r3, url };
+  }
+
   return { ...result, url };
 }
 
