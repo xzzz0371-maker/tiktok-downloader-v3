@@ -174,6 +174,7 @@
     box-shadow:0 8px 24px rgba(254,44,85,0.28);
   }
   .vacts .dl:hover{box-shadow:0 12px 30px rgba(254,44,85,0.36);}
+  .vacts .dl.busy{opacity:0.72;cursor:progress;filter:saturate(0.85);transform:none;}
   .vacts .open{background:var(--bg);color:var(--text);border:1px solid var(--line);}
   .vacts .open:hover{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 0 3px var(--cyan-soft);}
   .vacts .open svg{width:16px;height:16px;color:var(--cyan);}
@@ -333,7 +334,7 @@
           </div>
           <div class="vnote">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8.5h.01"/></svg>
-            <span>若点击下载后浏览器直接播放视频，请在新页面点击播放器右下角或右键选择「视频另存为」保存到本地。</span>
+            <span id="vNoteText">点击「下载无水印视频」会经同域代理直接保存到本地，无需右键。</span>
           </div>
         </div>
       </div>
@@ -449,6 +450,10 @@
   var vSource= document.getElementById('vSource');
   var vDl    = document.getElementById('vDownload');
   var vOpen  = document.getElementById('vOpen');
+  var vNoteText = document.getElementById('vNoteText');
+
+  // 同域视频代理（Cloudflare Pages advanced-mode Worker）：绕过跨域限制实现点击直接下载
+  var PROXY_API = '/api/proxy?url=';
 
   var PROXIES = [
     function(u){ return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u); },
@@ -624,6 +629,40 @@
     vWmark.hidden = true;
     vPlayer.hidden = false;
     vPlayer.play().catch(function(){ /* 自动播放被拦截时等待用户手动播放 */ });
+  });
+
+  // 点击"下载无水印视频"：经同域代理取流 → blob → 触发浏览器直接保存，无需右键
+  vDl.addEventListener('click', function(e){
+    e.preventDefault();
+    var src = vDl.getAttribute('href') || vDl.href;
+    if(!src || src === '#') return;
+    var orig = vDl.innerHTML;
+    vDl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9"/></svg>下载中…';
+    vDl.classList.add('busy');
+    fetch(PROXY_API + encodeURIComponent(src))
+      .then(function(r){
+        if(!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      })
+      .then(function(blob){
+        var objUrl = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = objUrl;
+        a.download = 'tiktok-' + Date.now() + '.mp4';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function(){ URL.revokeObjectURL(objUrl); }, 5000);
+        vNoteText.textContent = '已开始下载，请查看浏览器下载记录。';
+      })
+      .catch(function(){
+        window.open(src, '_blank');
+        vNoteText.textContent = '当前网络下代理下载不可用，已在新窗口打开视频，请在新页面右键或点击播放器选择「视频另存为」。';
+      })
+      .finally(function(){
+        vDl.innerHTML = orig;
+        vDl.classList.remove('busy');
+      });
   });
 
   vPlayer.addEventListener('ended', function(){
