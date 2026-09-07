@@ -270,19 +270,38 @@ function applyDownloadProgressToCard(card, progress) {
   }
 }
 
-// ---------- 更新所有卡片的下载进度 ----------
+// ---------- 更新所有卡片的下载进度（rAF 节流，避免高频 storage 事件反复写 DOM） ----------
+let _progressRafPending = false;
 function updateAllCardsProgress() {
-  const cards = videoList.querySelectorAll('.video-card');
-  cards.forEach(card => {
-    const videoId = card.dataset.videoId;
-    if (videoId && currentDownloads[videoId]) {
-      applyDownloadProgressToCard(card, currentDownloads[videoId]);
-    }
+  if (_progressRafPending) return;
+  _progressRafPending = true;
+  requestAnimationFrame(() => {
+    _progressRafPending = false;
+    const cards = videoList.querySelectorAll('.video-card');
+    cards.forEach(card => {
+      const videoId = card.dataset.videoId;
+      if (videoId && currentDownloads[videoId]) {
+        applyDownloadProgressToCard(card, currentDownloads[videoId]);
+      }
+    });
   });
 }
 
-// ---------- 刷新列表 ----------
-function refreshVideoList() {
+// ---------- 刷新列表（增量渲染，避免整表重建导致抽搐/闪烁） ----------
+// force=true 时强制全量重建（删除/排序变化等场景）
+function refreshVideoList(force) {
+  if (!force) {
+    const existing = videoList.querySelectorAll('.video-card');
+    const oldCount = existing.length;
+    // 解析是顺序追加：新列表更长时只追加新增卡片，保留已有卡片 DOM（封面图、滚动位置不丢）
+    if (oldCount > 0 && parsedVideos.length > oldCount) {
+      for (let i = oldCount; i < parsedVideos.length; i++) {
+        renderCard(parsedVideos[i], i);
+      }
+      updateToolbar();
+      return;
+    }
+  }
   videoList.innerHTML = '';
   parsedVideos.forEach((v, i) => renderCard(v, i));
   updateToolbar();
@@ -291,11 +310,28 @@ function refreshVideoList() {
   }
 }
 
+// ---------- 只更新"已下载"徽标状态（下载完成时调用，不重建列表） ----------
+function updateDownloadedBadges() {
+  videoList.querySelectorAll('.video-card').forEach(card => {
+    const vid = card.dataset.videoId;
+    const btn = card.querySelector('.btn-dl');
+    if (!vid || !btn) return;
+    const done = downloadedIds.has(vid);
+    const isMarked = btn.classList.contains('btn-downloaded');
+    if (done && !isMarked) {
+      btn.classList.add('btn-downloaded');
+      btn.textContent = '✓';
+    } else if (!done && isMarked) {
+      btn.classList.remove('btn-downloaded');
+    }
+  });
+}
+
 // ---------- 删除 ----------
 async function deleteVideo(index) {
   if (index < 0 || index >= parsedVideos.length) return;
   parsedVideos.splice(index, 1);
-  refreshVideoList();
+  refreshVideoList(true);
   await saveCache(parsedVideos);
 }
 
@@ -736,11 +772,11 @@ function setupEvents() {
       refreshVideoList();
     }
 
-    // 下载历史变化
+    // 下载历史变化：只更新徽标和计数，不重建列表（避免整表闪烁）
     if (changes.downloadedIds) {
       downloadedIds = new Set(changes.downloadedIds.newValue || []);
       updateHistoryToolbar();
-      refreshVideoList();
+      updateDownloadedBadges();
     }
   });
 }

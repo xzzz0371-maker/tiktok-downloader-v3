@@ -770,3 +770,30 @@ body.sidepanel-mode .badge { font-size: 10px; padding: 3px 10px; }
   body.sidepanel-mode .video-card { gap: 8px; padding: 8px 8px; }
   body.sidepanel-mode .video-card .cover { width: 56px; height: 56px; }
 }
+/* 超窄侧边栏（<360px，如最小宽度侧边栏）：纵向堆叠工具栏，杜绝换行挤压重叠 */
+@media (max-width: 360px) {
+  body.sidepanel-mode .logo span { display: none; }
+  body.sidepanel-mode .header { flex-wrap: nowrap; }
+  body.sidepanel-mode .header-right .icon-btn { padding: 4px 5px; font-size: 12px; }
+  body.sidepanel-mode .status-row { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  body.sidepanel-mode .setting-label { font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 输入区按钮横向排列不换行挤压 */
+  body.sidepanel-mode .input-actions { gap: 5px; flex-wrap: nowrap; }
+  body.sidepanel-mode .input-actions .btn { padding: 5px 9px; font-size: 10px; }
+  body.sidepanel-mode #statusIndicator { padding: 4px 8px; font-size: 10px; }
+  body.sidepanel-mode #statusIndicator .spinner { width: 11px; height: 11px; }
+  /* 结果工具栏纵向堆叠，按钮撑满 */
+  body.sidepanel-mode .result-toolbar { flex-direction: column; align-items: stretch; gap: 6px; }
+  body.sidepanel-mode .result-toolbar .btn-sm { width: 100%; padding: 6px 12px; }
+  body.sidepanel-mode .skip-downloaded-label { justify-content: flex-start; }
+  body.sidepanel-mode .history-toolbar { flex-direction: column; align-items: stretch; gap: 6px; }
+  body.sidepanel-mode .history-actions { justify-content: flex-end; }
+  /* 卡片压窄：封面再缩小，文字区保留 */
+  body.sidepanel-mode .video-card { gap: 7px; padding: 7px 8px; }
+  body.sidepanel-mode .video-card .cover { width: 48px; height: 48px; }
+  body.sidepanel-mode .video-card .actions .btn-dl { width: 30px; height: 30px; font-size: 12px; }
+  body.sidepanel-mode .video-card .info .title { font-size: 11px; -webkit-line-clamp: 2; padding-right: 10px; }
+  body.sidepanel-mode .video-card .info .meta { font-size: 9px; gap: 4px; }
+  body.sidepanel-mode .video-card .info .meta .quality { font-size: 9px; padding: 1px 5px; }
+  body.sidepanel-mode .video-card .progress-text { min-width: 58px; font-size: 9px; }
+}
