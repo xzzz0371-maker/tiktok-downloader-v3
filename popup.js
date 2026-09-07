@@ -293,6 +293,12 @@ function refreshVideoList(force) {
   if (!force) {
     const existing = videoList.querySelectorAll('.video-card');
     const oldCount = existing.length;
+    // 数量相同：比对 id 序列，未变则完全跳过（打开插件/状态刷新时避免重复全量重建导致闪烁）
+    if (oldCount > 0 && parsedVideos.length === oldCount) {
+      const ids = Array.from(existing).map(c => c.dataset.videoId);
+      const same = parsedVideos.every((v, i) => v.id === ids[i]);
+      if (same) return;
+    }
     // 解析是顺序追加：新列表更长时只追加新增卡片，保留已有卡片 DOM（封面图、滚动位置不丢）
     if (oldCount > 0 && parsedVideos.length > oldCount) {
       for (let i = oldCount; i < parsedVideos.length; i++) {
