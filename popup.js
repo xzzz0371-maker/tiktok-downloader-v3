@@ -893,34 +893,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     return '';
   }
 
-  // ===== 独立窗口模式：自动解析切换后的视频 =====
-  const isWindowMode = new URLSearchParams(window.location.search).get('window') === '1';
-  if (isWindowMode) {
-    document.body.classList.add('window-mode');
-    bringToFrontBtn.style.display = 'flex';
-    openWindowBtn.style.display = 'none'; // 独立窗口里不需要再打开独立窗口
-
-    // 拉到最前面按钮（先最小化再恢复，确保弹到最上层）
-    bringToFrontBtn.addEventListener('click', () => {
-      chrome.windows.getCurrent((win) => {
-        if (win?.id) {
-          chrome.windows.update(win.id, { state: 'minimized' }, () => {
-            setTimeout(() => {
-              chrome.windows.update(win.id, { state: 'normal', focused: true });
-            }, 120);
-          });
-        }
-      });
-    });
-
+  // ===== 通用：注册自动解析（弹窗 / 侧边栏 / 独立窗口共用） =====
+  function setupAutoParse(tabQueryOpts) {
     let autoParseTimer = null;
     let lastAutoParsedUrl = '';
 
     async function tryAutoParse() {
       try {
-        // 独立窗口模式下 currentWindow 是 popup 自己，所以查询所有窗口的活动标签页
-        const tabs = await chrome.tabs.query({ active: true });
-        for (const t of tabs) {
+        const tabs = await chrome.tabs.query(tabQueryOpts);
+        const list = Array.isArray(tabs) ? tabs : (tabs ? [tabs] : []);
+        for (const t of list) {
+          if (!t || !t.url) continue;
           const target = await getAutoParseTarget(t);
           if (target && target !== lastAutoParsedUrl) {
             lastAutoParsedUrl = target;
@@ -946,8 +929,32 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     });
 
-    // 独立窗口打开时立即尝试一次
+    // 打开时立即尝试一次
     setTimeout(tryAutoParse, 300);
+  }
+
+  // ===== 独立窗口模式：自动解析切换后的视频 =====
+  const isWindowMode = new URLSearchParams(window.location.search).get('window') === '1';
+  if (isWindowMode) {
+    document.body.classList.add('window-mode');
+    bringToFrontBtn.style.display = 'flex';
+    openWindowBtn.style.display = 'none'; // 独立窗口里不需要再打开独立窗口
+
+    // 拉到最前面按钮（先最小化再恢复，确保弹到最上层）
+    bringToFrontBtn.addEventListener('click', () => {
+      chrome.windows.getCurrent((win) => {
+        if (win?.id) {
+          chrome.windows.update(win.id, { state: 'minimized' }, () => {
+            setTimeout(() => {
+              chrome.windows.update(win.id, { state: 'normal', focused: true });
+            }, 120);
+          });
+        }
+      });
+    });
+
+    // 独立窗口：查询所有窗口的活动标签页（currentWindow 是 popup 自己）
+    setupAutoParse({ active: true });
   }
 
   // ===== 侧边栏模式：自动解析切换后的视频 =====
@@ -958,35 +965,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     openWindowBtn.style.display = 'none';
     sidePanelBtn.style.display = 'none'; // 已经在侧边栏里了
 
-    let autoParseTimer = null;
-    let lastAutoParsedUrl = '';
+    // 侧边栏：当前窗口的活动标签页
+    setupAutoParse({ active: true, currentWindow: true });
+  }
 
-    async function tryAutoParse() {
-      try {
-        // 侧边栏在浏览器窗口内，currentWindow 是正确的
-        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-        const tab = tabs?.[0];
-        const target = await getAutoParseTarget(tab);
-        if (target && target !== lastAutoParsedUrl) {
-          lastAutoParsedUrl = target;
-          urlInput.value = target;
-          handleParse(false);
-        }
-      } catch (e) {}
-    }
-
-    chrome.tabs.onActivated.addListener(() => {
-      clearTimeout(autoParseTimer);
-      autoParseTimer = setTimeout(tryAutoParse, 100);
-    });
-
-    chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-      if (changeInfo.url && tab.active) {
-        clearTimeout(autoParseTimer);
-        autoParseTimer = setTimeout(tryAutoParse, 100);
-      }
-    });
-
-    setTimeout(tryAutoParse, 300);
+  // ===== 弹窗（默认）模式：同样支持自动解析 =====
+  if (!isWindowMode && !isSidePanel) {
+    setupAutoParse({ active: true, currentWindow: true });
   }
 });
