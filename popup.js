@@ -791,6 +791,8 @@ function setupEvents() {
 //  初始化
 // ============================================================
 document.addEventListener('DOMContentLoaded', async () => {
+  // 显示当前版本号（确认扩展已更新到最新）
+  try { document.getElementById('versionTag').textContent = 'v' + chrome.runtime.getManifest().version; } catch (e) {}
   const pref = (await chrome.storage.local.get('themePreference')).themePreference || 'dark';
   applyTheme(pref);
   await updateStatus();
@@ -929,8 +931,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     });
 
-    // 打开时立即尝试一次
+    // 打开时立即尝试一次，页面未就绪时 1.5s 后再补一次（提取视口视频依赖页面渲染）
     setTimeout(tryAutoParse, 300);
+    setTimeout(() => {
+      if (!lastAutoParsedUrl) tryAutoParse();
+    }, 1500);
   }
 
   // ===== 独立窗口模式：自动解析切换后的视频 =====
