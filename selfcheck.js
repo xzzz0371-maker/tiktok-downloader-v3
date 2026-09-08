@@ -75,6 +75,7 @@ console.log('=== 3. 功能链路（插件） ===');
     ['代理失败重试', bg.includes('await sleep(1200)')],
     ['卡死超时不杀大文件', bg.includes('checkTimeout')],
     ['单视频预算防堵队列', bg.includes('EFFORT_MS') && bg.includes('_gaveUp')],
+    ['强制无水印（结果与候选过滤）', bg.includes('looksWatermarked') && bg.includes('rejectedWatermark')],
     ['图集代理兜底', bg.includes('OWN_PROXY_API + encodeURIComponent(imageUrl)')],
     ['recommend-auto-parse 监听', bg.includes("type === 'recommend-auto-parse'")],
     ['download-single 监听', bg.includes("type === 'download-single'")],

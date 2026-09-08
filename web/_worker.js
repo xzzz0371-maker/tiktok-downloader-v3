@@ -230,14 +230,15 @@ function extractDouyinVideo(html) {
 
 
 async function parseFromPage(finalUrl, diag) {
-  let lastErr = null;
-  for (const ua of [UA, MOBILE_UA, GOOGLEBOT_UA]) {
-    try {
-      const r = await parseHtmlWithUA(finalUrl, ua, diag);
-      if (r) return r;
-    } catch (e) { lastErr = e; }
+  // 速度优先：3 个 UA 并行请求，谁先拿到视频数据用谁的（原来是串行逐个等超时）
+  const attempts = [UA, MOBILE_UA, GOOGLEBOT_UA].map(ua =>
+    parseHtmlWithUA(finalUrl, ua, diag).catch(e => { throw e; })
+  );
+  try {
+    return await Promise.any(attempts);
+  } catch (e) {
+    throw new Error('page no video data');
   }
-  throw lastErr || new Error('page no video data');
 }
 
 async function parseHtmlWithUA(finalUrl, userAgent, diag) {
@@ -402,59 +403,56 @@ async function getTikTokCookie() {
   return cookieCache.value;
 }
 
-// TikTok 官方内部 API 通用查询：item/detail 与 item/get（带 cookie，多区域轮询，
-// 缓解 region-lock 视频 playAddr 为空；两个接口互为冗余，提高命中率）
+// TikTok 官方内部 API 通用查询：item/detail 与 item/get（带 cookie，多区域并行竞速，
+// 缓解 region-lock 视频 playAddr 为空；两个接口互为冗余，提高命中率并缩短耗时）
 async function parseTiktokOfficial(itemId, apiPath, sourceName) {
   const ck = await getTikTokCookie();
   const REGIONS = ['US', 'SG', 'ID', 'MY', 'HK', 'TW', 'JP'];
-  let lastErr = null;
-  for (const region of REGIONS) {
-    try {
-      const resp = await fetchWithTimeout(
-        'https://www.tiktok.com' + apiPath + '?itemId=' + itemId + '&aid=1988&app_language=en&device_platform=web_pc&os=windows&region=' + region,
-        {
-          headers: {
-            'User-Agent': UA,
-            'Cookie': ck || 'tt_webid_v2=0;tt_csrf_token=0',
-            'Referer': 'https://www.tiktok.com/',
-            'Accept': 'application/json, text/plain, */*'
-          }
-        }, API_TIMEOUT);
-      if (!resp.ok) { lastErr = new Error(sourceName + ' HTTP ' + resp.status); continue; }
-      const txt = await resp.text();
-      if (!txt || txt.length < 10) { lastErr = new Error(sourceName + ' empty'); continue; }
-      const d = JSON.parse(txt);
-      const v = d?.itemInfo?.itemStruct || d?.data?.itemInfo?.itemStruct;
-      if (v?.id) {
-        const vd = v.video || {};
-        const addr = resolveAddr(vd);
-        const ip = v.imagePost || {};
-        const imgArr = Array.isArray(v.images) ? v.images : (Array.isArray(ip.images) ? ip.images : []);
-        const images = imgArr.map(i => {
-          const o = (i && (i.imageURL || i.imageUrl || i)) || {};
-          const list = o.urlList || (o.imageURL && o.imageURL.urlList) || [];
-          return list[0] || '';
-        }).filter(Boolean);
-        if (addr || images.length) {
-          return {
-            success: true,
-            type: images.length && !addr ? 'photo' : 'video',
-            id: v.id || Date.now(), title: v.desc || '', author: v.author?.nickname || '',
-            authorAvatar: v.author?.avatarLarger || v.author?.avatarThumb || '',
-            cover: v.originCover || v.cover || (vd.cover || ''),
-            videoUrl: addr, hdVideoUrl: addr,
-            images, duration: vd.duration || 0,
-            likes: (v.stats && (v.stats.diggCount || v.stats.digg_count)) || 0,
-            createTime: v.createTime || 0, source: sourceName
-          };
+  // 速度优先：所有地区并行发请求，谁先返回可用结果用谁的（原来是逐地区串行等超时）
+  const tries = REGIONS.map(region => (async () => {
+    const resp = await fetchWithTimeout(
+      'https://www.tiktok.com' + apiPath + '?itemId=' + itemId + '&aid=1988&app_language=en&device_platform=web_pc&os=windows&region=' + region,
+      {
+        headers: {
+          'User-Agent': UA,
+          'Cookie': ck || 'tt_webid_v2=0;tt_csrf_token=0',
+          'Referer': 'https://www.tiktok.com/',
+          'Accept': 'application/json, text/plain, */*'
         }
-        lastErr = new Error(sourceName + ' no addr (region=' + region + ')');
-      } else {
-        lastErr = new Error(sourceName + ' no struct');
-      }
-    } catch (e) { lastErr = e; }
+      }, API_TIMEOUT);
+    if (!resp.ok) throw new Error(sourceName + ' HTTP ' + resp.status);
+    const txt = await resp.text();
+    if (!txt || txt.length < 10) throw new Error(sourceName + ' empty');
+    const d = JSON.parse(txt);
+    const v = d?.itemInfo?.itemStruct || d?.data?.itemInfo?.itemStruct;
+    if (!v?.id) throw new Error(sourceName + ' no struct');
+    const vd = v.video || {};
+    const addr = resolveAddr(vd);
+    const ip = v.imagePost || {};
+    const imgArr = Array.isArray(v.images) ? v.images : (Array.isArray(ip.images) ? ip.images : []);
+    const images = imgArr.map(i => {
+      const o = (i && (i.imageURL || i.imageUrl || i)) || {};
+      const list = o.urlList || (o.imageURL && o.imageURL.urlList) || [];
+      return list[0] || '';
+    }).filter(Boolean);
+    if (!addr && !images.length) throw new Error(sourceName + ' no addr');
+    return {
+      success: true,
+      type: images.length && !addr ? 'photo' : 'video',
+      id: v.id || Date.now(), title: v.desc || '', author: v.author?.nickname || '',
+      authorAvatar: v.author?.avatarLarger || v.author?.avatarThumb || '',
+      cover: v.originCover || v.cover || (vd.cover || ''),
+      videoUrl: addr, hdVideoUrl: addr,
+      images, duration: vd.duration || 0,
+      likes: (v.stats && (v.stats.diggCount || v.stats.digg_count)) || 0,
+      createTime: v.createTime || 0, source: sourceName
+    };
+  })());
+  try {
+    return await Promise.any(tries);
+  } catch (e) {
+    throw new Error(sourceName + ' no data');
   }
-  throw lastErr || new Error(sourceName + ' no data');
 }
 async function parseViaItemDetail(itemId) { return parseTiktokOfficial(itemId, '/api/item/detail/', 'tiktok-item-detail'); }
 async function parseViaItemGet(itemId) { return parseTiktokOfficial(itemId, '/api/item/get/', 'tiktok-item-get'); }

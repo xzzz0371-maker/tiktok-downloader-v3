@@ -26,9 +26,10 @@ function formatDate(ts) {
 }
 
 const API_TIMEOUT = 10000;
-// 解析两段式窗口：第一段“原画质通道”最多等 5 秒，第二段“第三方 API 全并行”最多 3 秒
-const PARSE_ORIG_MS = 5000;
-const PARSE_API_MS = 3000;
+// 解析两段式窗口（速度优先版）：
+// 第一段“无水印/原画质通道”最多等 3 秒；第二段“第三方无水印源并行”最多 2 秒
+const PARSE_ORIG_MS = 3000;
+const PARSE_API_MS = 2000;
 // 下载候选“首次无进展”判定：30 秒内没有任何字节进展才取消该候选，随后继续下一候选/重试。
 // 只要下载一直在走字节，观察会不断顺延（见 runDownload 的 checkTimeout），不会误杀大文件。
 const FIRST_STALL_CHECK_MS = 30000;
@@ -1137,6 +1138,18 @@ async function parseViaOwnBackendMode(finalUrl, mode) {
   };
 }
 
+// 判定一个媒体 URL 是否“明显带水印”（playwm / watermark=1 / /watermark/ 等）。
+// 用户要求“只要无水印”，带水印地址不作为解析结果与下载候选。
+function looksWatermarked(rawUrl) {
+  const u = String(rawUrl || '');
+  if (!u) return false;
+  // 明确无水印标记直接放行，避免误伤
+  if (/watermark=0|wm=0|no_watermark|hdplay|hd_play|bitrate/i.test(u)) return false;
+  return /playwm/i.test(u)
+      || /watermark=1|wm=1/i.test(u)
+      || /\/watermark\/|watermark\/1|_wm\.mp4/i.test(u);
+}
+
 async function parseVideo(url, opts = {}) {
   let finalUrl = url.trim();
 
@@ -1156,18 +1169,24 @@ async function parseVideo(url, opts = {}) {
   const encoded = encodeURIComponent(finalUrl);
   const availableApis = getApiList(encoded).filter(api => !isApiInCooldown(api.url));
   const timeoutOf = (ms, msg) => new Promise((_, reject) => setTimeout(() => reject(new Error(msg)), ms));
-  // 收尾：统一 originalUrl/id，并触发语言/评论异步补充
+  // 收尾：统一 originalUrl/id，并触发语言/评论异步补充。
+  // 速度优先 + 强制无水印：视频结果如果只拿到“明显带水印”的地址，按失败处理，
+  // 绝不把带水印的当成成功结果返回。
   const finalize = (r) => {
     if (!r || !r.success) throw new Error('parse fail');
+    const urls = [r.hdVideoUrl, r.videoUrl].filter(Boolean);
+    const isAlbum = (r.type === 'photo') || ((r.images && r.images.length) && urls.length === 0);
+    const hasCleanUrl = urls.some(u => !looksWatermarked(u));
+    if (!isAlbum && !hasCleanUrl) throw new Error('仅获取到带水印地址，已丢弃');
     r.originalUrl = finalUrl;
     r.id = r.id == null || r.id === '' ? String(Date.now()) : String(r.id);
     enrichVideoAsync(r);
     return r;
   };
 
-  // ===== 第一段（最多 5 秒）：只跑“能出原画质/无水印”的通道 =====
+  // ===== 第一段（最多 3 秒）：只跑“无水印/原画质”通道 =====
   // 本地拦截 / 页面深度解析 / FetchHTML / 自建后端 html（抖音直抓）/ TikTok 官方 item。
-  // 任何一个先返回就立即收工 —— 命中时大多 1~3 秒出结果。
+  // 任何一个先返回就立即收工 —— 命中时大多 1~2 秒出结果。
   const origSources = [];
   origSources.push(parseViaOwnBackendMode(finalUrl, 'html').then(finalize).catch(e => { throw e; }));
   if (/\/video\/\d+|\/v\/\d+/.test(finalUrl)) {
@@ -1183,14 +1202,14 @@ async function parseVideo(url, opts = {}) {
   try {
     const r1 = await Promise.race([
       Promise.any(origSources),
-      timeoutOf(PARSE_ORIG_MS, '原画质通道 5 秒超时')
+      timeoutOf(PARSE_ORIG_MS, '无水印通道超时')
     ]);
     if (r1?.success) return r1;
   } catch (e) {
-    console.log('[解析] 第一段原画质通道未命中（' + PARSE_ORIG_MS + 'ms），切第三方并行:', e.message);
+    console.log('[解析] 第一段无水印通道未命中（' + PARSE_ORIG_MS + 'ms），切第三方并行:', e.message);
   }
 
-  // ===== 第二段（3 秒）：第三方公共 API 全部并行 + 自建后端 api 池，谁快用谁 =====
+  // ===== 第二段（2 秒）：第三方无水印源并行，谁快用谁（带水印结果会被 finalize 丢弃）=====
   const apiSources = [];
   apiSources.push(parseViaOwnBackendMode(finalUrl, 'api').then(finalize).catch(e => { throw e; }));
   for (const api of availableApis) {
@@ -1202,14 +1221,14 @@ async function parseVideo(url, opts = {}) {
   try {
     const r2 = await Promise.race([
       Promise.any(apiSources),
-      timeoutOf(PARSE_API_MS, '第三方 API 3 秒超时')
+      timeoutOf(PARSE_API_MS, '第三方无水印源超时')
     ]);
     if (r2?.success) return r2;
   } catch (e) {
-    console.log('[解析] 第二段第三方也全挂:', e.message);
+    console.log('[解析] 第二段也无水印结果:', e.message);
   }
 
-  return { success: false, originalUrl: finalUrl, error: '所有解析源均失败' };
+  return { success: false, originalUrl: finalUrl, error: '未能获取到无水印资源' };
 }
 
 function extractVideoIdFromUrl(url) {
@@ -1787,13 +1806,16 @@ async function downloadSingleVideo(video, language = '') {
   }
 
   // 2) 候选地址去重排序：新签名 → 缓存高清 → 备用地址 → 解析源普通地址。
-  //    D：m3u8(HLS) 无法被浏览器直接存成可用 mp4，直接剔除，避免下到一堆没用的分片清单
+  //    D：m3u8(HLS) 无法被浏览器直接存成可用 mp4，剔除，避免下到一堆没用的分片清单。
+  //    速度优先+强制无水印：URL 明显带水印(playwm/watermark=1/…)的一律不入候选。
   const hlsCandidates = [];
+  let rejectedWatermark = false;
   const candidates = [];
   const pushCand = (u) => {
     u = (u || '').trim();
     if (!u || candidates.includes(u) || hlsCandidates.includes(u)) return;
     if (/\.m3u8(\?|$)/i.test(u)) hlsCandidates.push(u);
+    else if (looksWatermarked(u)) rejectedWatermark = true; // 不要带水印的
     else candidates.push(u);
   };
   pushCand(freshUrl);
@@ -1802,8 +1824,10 @@ async function downloadSingleVideo(video, language = '') {
   pushCand(video.videoUrl);
   if (candidates.length === 0) {
     return hlsCandidates.length
-      ? { success: false, error: '该视频仅有 HLS(m3u8) 流，无法直接保存为 mp4，请换其它解析源', url: null }
-      : { success: false, error: '无视频链接', url: null };
+      ? { success: false, error: '该视频仅有 HLS(m3u8) 流，无法直接保存为 mp4', url: null }
+      : rejectedWatermark
+        ? { success: false, error: '该视频当前只有带水印地址，已按要求不放行', url: null }
+        : { success: false, error: '无视频链接', url: null };
   }
 
   // 3) 直连逐个尝试 —— C：只对“直连白名单 CDN”试直连；名单外的（Akamai 等校验严格）
