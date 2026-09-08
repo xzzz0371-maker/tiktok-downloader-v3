@@ -153,9 +153,6 @@ function renderCard(video, index) {
   const likesLabel = video.likes ? `❤️ ${escapeHtml(video.likes)}` : '';
   const dateLabel = video.createTime ? `📅 ${escapeHtml(video.createTime)}` : '';
   const sourceLabel = getSourceLabel(video._parseSource);
-  const qualityLabel = (video.type === 'photo' || (video.images && video.images.length))
-    ? '🖼 图集 ' + (video.images ? video.images.length : 0) + ' 张'
-    : (video.quality || '高清');
 
   card.innerHTML = `
     <div class="cover" data-preview="${index}" style="cursor:pointer;">
@@ -168,7 +165,7 @@ function renderCard(video, index) {
       <div class="title" data-preview="${index}" title="${safeTitle}">${safeTitle}</div>
       <div class="meta">
         <span class="author">👤 ${safeAuthor}</span>
-        <span class="quality">${escapeHtml(qualityLabel)}</span>
+        <span class="quality">${escapeHtml(video.quality || '高清')}</span>
         ${langLabel ? `<span>${langLabel}</span>` : ''}
         ${likesLabel ? `<span>${likesLabel}</span>` : ''}
         ${dateLabel ? `<span>${dateLabel}</span>` : ''}
@@ -270,44 +267,19 @@ function applyDownloadProgressToCard(card, progress) {
   }
 }
 
-// ---------- 更新所有卡片的下载进度（rAF 节流，避免高频 storage 事件反复写 DOM） ----------
-let _progressRafPending = false;
+// ---------- 更新所有卡片的下载进度 ----------
 function updateAllCardsProgress() {
-  if (_progressRafPending) return;
-  _progressRafPending = true;
-  requestAnimationFrame(() => {
-    _progressRafPending = false;
-    const cards = videoList.querySelectorAll('.video-card');
-    cards.forEach(card => {
-      const videoId = card.dataset.videoId;
-      if (videoId && currentDownloads[videoId]) {
-        applyDownloadProgressToCard(card, currentDownloads[videoId]);
-      }
-    });
+  const cards = videoList.querySelectorAll('.video-card');
+  cards.forEach(card => {
+    const videoId = card.dataset.videoId;
+    if (videoId && currentDownloads[videoId]) {
+      applyDownloadProgressToCard(card, currentDownloads[videoId]);
+    }
   });
 }
 
-// ---------- 刷新列表（增量渲染，避免整表重建导致抽搐/闪烁） ----------
-// force=true 时强制全量重建（删除/排序变化等场景）
-function refreshVideoList(force) {
-  if (!force) {
-    const existing = videoList.querySelectorAll('.video-card');
-    const oldCount = existing.length;
-    // 数量相同：比对 id 序列，未变则完全跳过（打开插件/状态刷新时避免重复全量重建导致闪烁）
-    if (oldCount > 0 && parsedVideos.length === oldCount) {
-      const ids = Array.from(existing).map(c => c.dataset.videoId);
-      const same = parsedVideos.every((v, i) => v.id === ids[i]);
-      if (same) return;
-    }
-    // 解析是顺序追加：新列表更长时只追加新增卡片，保留已有卡片 DOM（封面图、滚动位置不丢）
-    if (oldCount > 0 && parsedVideos.length > oldCount) {
-      for (let i = oldCount; i < parsedVideos.length; i++) {
-        renderCard(parsedVideos[i], i);
-      }
-      updateToolbar();
-      return;
-    }
-  }
+// ---------- 刷新列表 ----------
+function refreshVideoList() {
   videoList.innerHTML = '';
   parsedVideos.forEach((v, i) => renderCard(v, i));
   updateToolbar();
@@ -316,28 +288,11 @@ function refreshVideoList(force) {
   }
 }
 
-// ---------- 只更新"已下载"徽标状态（下载完成时调用，不重建列表） ----------
-function updateDownloadedBadges() {
-  videoList.querySelectorAll('.video-card').forEach(card => {
-    const vid = card.dataset.videoId;
-    const btn = card.querySelector('.btn-dl');
-    if (!vid || !btn) return;
-    const done = downloadedIds.has(vid);
-    const isMarked = btn.classList.contains('btn-downloaded');
-    if (done && !isMarked) {
-      btn.classList.add('btn-downloaded');
-      btn.textContent = '✓';
-    } else if (!done && isMarked) {
-      btn.classList.remove('btn-downloaded');
-    }
-  });
-}
-
 // ---------- 删除 ----------
 async function deleteVideo(index) {
   if (index < 0 || index >= parsedVideos.length) return;
   parsedVideos.splice(index, 1);
-  refreshVideoList(true);
+  refreshVideoList();
   await saveCache(parsedVideos);
 }
 
@@ -385,7 +340,7 @@ async function clearHistory() {
   await chrome.storage.local.remove('downloadedIds');
   downloadedIds = new Set();
   updateHistoryToolbar();
-  updateDownloadedBadges();
+  refreshVideoList();
   showToast('✅ 下载历史已清空');
 }
 
@@ -778,11 +733,11 @@ function setupEvents() {
       refreshVideoList();
     }
 
-    // 下载历史变化：只更新徽标和计数，不重建列表（避免整表闪烁）
+    // 下载历史变化
     if (changes.downloadedIds) {
       downloadedIds = new Set(changes.downloadedIds.newValue || []);
       updateHistoryToolbar();
-      updateDownloadedBadges();
+      refreshVideoList();
     }
   });
 }
@@ -861,38 +816,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (e) {}
   }, 400);
 
-  // ===== 共享：自动解析目标判定（视频页/推荐页/搜索页/标签页/用户主页） =====
-  async function getAutoParseTarget(tab) {
-    const url = (tab && tab.url) || '';
-    if (!url) return '';
-    if (!/tiktok\.com|douyin\.com|iesdouyin\.com|tiktokv\.com/.test(url)) return '';
-    // 视频详情页 / 短链：直接用页面 URL
-    if (/\/video\/\d+|\/v\/\d+|v\.douyin\.com|vm\.tiktok\.com/.test(url)) return url;
-    // 搜索页 / 标签页 / 用户主页 / 推荐页 / 首页：提取视口内第一个视频链接
-    if (/\/search|\/tag\/|\/@|foryou|^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)|^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)|^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url)) {
-      try {
-        const res = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: () => {
-            const links = Array.from(document.querySelectorAll('a[href*="/video/"]'));
-            for (const a of links) {
-              const r = a.getBoundingClientRect();
-              if (r.width > 0 && r.bottom > 0 && r.top < window.innerHeight) {
-                const m1 = a.href.match(/\/@([^\/?]+)\/video\/(\d+)/);
-                if (m1) return 'https://www.tiktok.com/@' + m1[1] + '/video/' + m1[2];
-                const m2 = a.href.match(/\/video\/(\d+)/);
-                if (m2) return 'https://www.tiktok.com/video/' + m2[1];
-              }
-            }
-            return '';
-          }
-        });
-        return (res && res[0] && res[0].result) || '';
-      } catch (e) { return ''; }
-    }
-    return '';
-  }
-
   // ===== 独立窗口模式：自动解析切换后的视频 =====
   const isWindowMode = new URLSearchParams(window.location.search).get('window') === '1';
   if (isWindowMode) {
@@ -920,14 +843,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       try {
         // 独立窗口模式下 currentWindow 是 popup 自己，所以查询所有窗口的活动标签页
         const tabs = await chrome.tabs.query({ active: true });
-        for (const t of tabs) {
-          const target = await getAutoParseTarget(t);
-          if (target && target !== lastAutoParsedUrl) {
-            lastAutoParsedUrl = target;
-            urlInput.value = target;
-            handleParse(false); // 解析中也提交，后台会排队
-            break;
-          }
+        // 只匹配视频详情页和首页/推荐页，排除搜索页/用户主页
+        const videoTab = tabs.find(t => {
+          const u = t.url || '';
+          return u.includes('/video/') || u.includes('/v/') || u.includes('v.douyin.com')
+              || /^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)/.test(u)
+              || /^https?:\/\/(www\.)?tiktok\.com\/foryou\/?(\?|$)/.test(u)
+              || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)/.test(u)
+              || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/foryou\/?(\?|$)/.test(u)
+              || /^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(u);
+        });
+        const url = videoTab?.url || '';
+        if (!url) return;
+        if (url !== lastAutoParsedUrl) {
+          lastAutoParsedUrl = url;
+          urlInput.value = url;
+          handleParse(false); // 解析中也提交，后台会排队
         }
       } catch (e) {}
     }
@@ -965,11 +896,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       try {
         // 侧边栏在浏览器窗口内，currentWindow 是正确的
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-        const tab = tabs?.[0];
-        const target = await getAutoParseTarget(tab);
-        if (target && target !== lastAutoParsedUrl) {
-          lastAutoParsedUrl = target;
-          urlInput.value = target;
+        const url = tabs?.[0]?.url || '';
+        if (!url) return;
+        // 只匹配视频详情页和首页/推荐页，排除搜索页/用户主页
+        const isVideoPage = url.includes('/video/') || url.includes('/v/') || url.includes('v.douyin.com')
+                        || /^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)/.test(url)
+                        || /^https?:\/\/(www\.)?tiktok\.com\/foryou\/?(\?|$)/.test(url)
+                        || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)/.test(url)
+                        || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/foryou\/?(\?|$)/.test(url)
+                        || /^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url);
+        if (isVideoPage && url !== lastAutoParsedUrl) {
+          lastAutoParsedUrl = url;
+          urlInput.value = url;
           handleParse(false);
         }
       } catch (e) {}

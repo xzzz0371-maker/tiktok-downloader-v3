@@ -454,29 +454,6 @@
 
   // 同域视频代理（Cloudflare Pages advanced-mode Worker）：绕过跨域限制实现点击直接下载
   var PROXY_API = '/api/proxy?url=';
-  // 自建解析后端（同域 Worker）：海外多源解析 + 页面直抓，成功率远高于浏览器直连第三方
-  var OWN_PARSE_API = '/api/parse';
-  var OWN_TOKEN = 'tdp2026x7kq9mz3vn8clw4r';
-  var lastInput = '';
-  async function parseViaOwnBackend(rawUrl){
-    try{
-      var r = await fetch(OWN_PARSE_API + '?url=' + encodeURIComponent(rawUrl) + '&token=' + OWN_TOKEN, { signal: AbortSignal.timeout(15000) });
-      if(!r.ok) return null;
-      var d = await r.json();
-      if(!d || !d.success) return null;
-      if(!d.videoUrl && (!d.images || !d.images.length)) return null;
-      return {
-        videoUrl: d.videoUrl || '',
-        cover: d.cover || '',
-        title: d.title || '',
-        author: d.author || '',
-        duration: d.duration || 0,
-        images: d.images || [],
-        type: d.type || 'video',
-        source: '自建后端'
-      };
-    }catch(e){ return null; }
-  }
 
   var PROXIES = [
     function(u){ return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u); },
@@ -579,8 +556,6 @@
   }
 
   async function resolve(url){
-    var own = await parseViaOwnBackend(url);
-    if(own) return own;
     for(var i=0;i<SOURCES.length;i++){
       try{
         var txt = await fetchText(SOURCES[i].build(url));
@@ -639,15 +614,7 @@
     vAuthor.textContent = v.author || '未知作者';
     vTitle.innerHTML = renderTitle(v.title || '（无标题）');
     vSource.textContent = '来源：' + v.source;
-    if(v.images && v.images.length && !v.videoUrl){
-      vDl.dataset.album = '1';
-      vDl.dataset.albumUrls = JSON.stringify(v.images);
-      vDl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 21h16"/></svg>下载图集（' + v.images.length + ' 张）';
-    } else {
-      delete vDl.dataset.album;
-      delete vDl.dataset.albumUrls;
-    }
-    vDl.href = v.videoUrl || (v.images && v.images[0]) || '#';
+    vDl.href = v.videoUrl;
     vDl.setAttribute('download','');
     vOpen.href = v.videoUrl;
     resBox.classList.add('show');
@@ -665,68 +632,37 @@
   });
 
   // 点击"下载无水印视频"：经同域代理取流 → blob → 触发浏览器直接保存，无需右键
-  // 点击下载：经同域代理取流 → blob → 直接保存；图集依次下载全部图片
-  // 失败（TikTok CDN 间歇风控）→ 重新解析拿新签名链接重试，最多 2 次
   vDl.addEventListener('click', function(e){
     e.preventDefault();
     var src = vDl.getAttribute('href') || vDl.href;
     if(!src || src === '#') return;
     var orig = vDl.innerHTML;
-    var attempt = 0;
-    var doDownload = function(targetUrls){
-      vDl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9"/></svg>下载中…';
-      vDl.classList.add('busy');
-      var dlOne = function(u, i){
-        return fetch(PROXY_API + encodeURIComponent(u))
-          .then(function(r){ if(!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
-          .then(function(blob){
-            var objUrl = URL.createObjectURL(blob);
-            var a = document.createElement('a');
-            var m = (u.match(/\.(png|jpe?g|webp|mp4)/i)||[])[1] || 'mp4';
-            a.href = objUrl;
-            a.download = 'tiktok-' + Date.now() + '-' + (i + 1) + '.' + m;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(function(){ URL.revokeObjectURL(objUrl); }, 5000);
-          });
-      };
-      var chain = targetUrls.reduce(function(p, u, i){ return p.then(function(){ return dlOne(u, i); }); }, Promise.resolve());
-      chain
-        .then(function(){
-          vNoteText.textContent = '已开始下载' + (targetUrls.length > 1 ? ' ' + targetUrls.length + ' 张图片' : '') + '，请查看浏览器下载记录。';
-          vDl.innerHTML = orig;
-          vDl.classList.remove('busy');
-        })
-        .catch(function(){
-          if(attempt < 2 && lastInput){
-            attempt++;
-            resolve(lastInput).then(function(nv){
-              if(nv){
-                vDl.href = nv.videoUrl || (nv.images && nv.images[0]) || '#';
-                var retryUrls = (nv.images && nv.images.length && !nv.videoUrl) ? nv.images : [nv.videoUrl || src];
-                doDownload(retryUrls);
-              } else {
-                window.open(src, '_blank');
-                vNoteText.textContent = '代理下载多次失败，已在新窗口打开，请右键「另存为」。';
-                vDl.innerHTML = orig;
-                vDl.classList.remove('busy');
-              }
-            }).catch(function(){
-              window.open(src, '_blank');
-              vNoteText.textContent = '重新解析失败，已在新窗口打开原链接。';
-              vDl.innerHTML = orig;
-              vDl.classList.remove('busy');
-            });
-          } else {
-            window.open(src, '_blank');
-            vNoteText.textContent = '当前网络下代理下载不可用，已在新窗口打开，请在新页面右键「另存为」。';
-            vDl.innerHTML = orig;
-            vDl.classList.remove('busy');
-          }
-        });
-    };
-    doDownload((vDl.dataset.album && vDl.dataset.albumUrls) ? JSON.parse(vDl.dataset.albumUrls) : [src]);
+    vDl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9"/></svg>下载中…';
+    vDl.classList.add('busy');
+    fetch(PROXY_API + encodeURIComponent(src))
+      .then(function(r){
+        if(!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      })
+      .then(function(blob){
+        var objUrl = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = objUrl;
+        a.download = 'tiktok-' + Date.now() + '.mp4';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function(){ URL.revokeObjectURL(objUrl); }, 5000);
+        vNoteText.textContent = '已开始下载，请查看浏览器下载记录。';
+      })
+      .catch(function(){
+        window.open(src, '_blank');
+        vNoteText.textContent = '当前网络下代理下载不可用，已在新窗口打开视频，请在新页面右键或点击播放器选择「视频另存为」。';
+      })
+      .finally(function(){
+        vDl.innerHTML = orig;
+        vDl.classList.remove('busy');
+      });
   });
 
   vPlayer.addEventListener('ended', function(){
@@ -760,7 +696,6 @@
       setBusy(false);
       if(v){
         hideStatus();
-        lastInput = url;
         showResult(v);
       }else{
         setStatus('解析失败：请确认链接有效、可公开访问，稍后重试', true);
