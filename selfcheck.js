@@ -138,5 +138,15 @@ try {
   st ? console.log('  未提交文件:\n' + st.split('\n').map(l => '    ' + l).join('\n')) : ok('工作区干净');
 } catch (e) { bad('git status 失败'); }
 
+console.log('=== 7. 自动解析模拟测试（真实执行 popup.js） ===');
+try {
+  const out = execFileSync(process.execPath, [path.join(ROOT, 'autoparse_test.js')], { encoding: 'utf8' });
+  const last = out.trim().split('\n').slice(-1)[0];
+  if (last.includes('0 失败')) ok('autoparse_test: ' + last);
+  else bad('autoparse_test 未全过: ' + last);
+} catch (e) {
+  bad('autoparse_test 运行失败: ' + (e.stdout || e.message || '').toString().split('\n').slice(-2).join(' '));
+}
+
 console.log('\n========== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ==========');
 process.exit(fail > 0 ? 1 : 0);
