@@ -55,6 +55,10 @@ let currentDownloads = {};
 // 已下载的视频 ID 集合（用于标记和去重）
 let downloadedIds = new Set();
 
+// 详情页/图集/短链识别：这类“打开就是一个视频”的页面应尽量每次都自动解析，
+// 不进 30 分钟冷却（冷却只用于首页/搜索等靠视口猜目标、易误伤空页的场景）
+const DETAIL_URL_RE = /\/video\/\d+|\/v\/\d+|\/photo\/\d+|\/slideshow\/\d+|v\.douyin\.com|vm\.tiktok\.com|\/note\/\d+/i;
+
 // ---------- 自动解析冷却：同一目标短时间不重复自动解析 ----------
 // 目的：空白/失效/无视频页面被误判时，只白跑一次（或不再白跑），
 // 避免每次打开弹窗、切换标签都把同一页面反复送去解析浪费时间。
@@ -1019,8 +1023,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!/tiktok\.com|douyin\.com|iesdouyin\.com|tiktokv\.com/.test(url)) return '';
     // 明确不是视频内容的页面（帮助/版权/登录/下载/直播/广告等），直接排除
     if (/(^|\/)(about|legal|privacy|terms|community|guidelines|advertise|business|creator|download|login|signup|live)\b/i.test(url)) return '';
-    // 视频详情页 / 短链 / 抖音图集（纯图帖）：直接用页面 URL
-    if (/\/video\/\d+|\/v\/\d+|v\.douyin\.com|vm\.tiktok\.com|douyin\.com\/note\/\d+/.test(url)) return url;
+    // 模态播放页：在首页/用户主页里点开视频，URL 仍是首页路径但带 modal_id=视频id
+    try {
+      const modal = new URL(url).searchParams.get('modal_id');
+      if (modal && /^\d{8,}$/.test(modal)) {
+        return /douyin\.com|iesdouyin\.com/i.test(url)
+          ? `https://www.douyin.com/video/${modal}`
+          : `https://www.tiktok.com/video/${modal}`;
+      }
+    } catch (e) {}
+    // 视频详情页 / 图集（photo/slideshow/note）/ 短链：直接用页面 URL
+    if (DETAIL_URL_RE.test(url)) return url;
     // 其它（首页/推荐/搜索/标签/用户主页/发现页）：必须真能取到“视口内的视频链接”才自动解析
     if (/\/search|\/tag\/|\/@|foryou|discover|^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)|^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)|^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url)) {
       try {
@@ -1066,8 +1079,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (!t || !t.url) continue;
           const target = await getAutoParseTarget(t);
           if (target && target !== lastAutoParsedUrl) {
-            // 该目标刚自动解析过（含失败/无效页）→ 进入冷却，跳过，避免反复白解析
-            if (isAutoInCooldown(target)) continue;
+            // 首页/搜索/标签等“靠视口猜”的目标才受冷却限制（防空页白解析）；
+            // 视频详情/图集/短链这种“打开即一个视频”的页面不受冷却限制，尽量每次都自动解析
+            const isDetail = DETAIL_URL_RE.test(target);
+            if (!isDetail && isAutoInCooldown(target)) continue;
             lastAutoParsedUrl = target;
             // 追加而不是覆盖输入框：不弄丢用户已经粘贴/输入的其它链接
             const lines = (urlInput.value || '').split('\n').map(s => s.trim()).filter(Boolean);
@@ -1076,7 +1091,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               urlInput.value = lines.join('\n');
             }
             handleParse(false, true); // 解析中也提交，后台会排队（silent：重复目标时不打扰）
-            markAutoCooldown(target);
+            if (!isDetail) markAutoCooldown(target);
             break;
           }
         }
