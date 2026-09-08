@@ -1052,7 +1052,8 @@ function recordApiFailure(apiUrl) {
 async function fetchAndParse(apiDef) {
   const apiUrl = apiDef.url;
   try {
-    const resp = await fetchWithTimeout(apiUrl, {}, 6000);
+    // 公共 API 单次超时 3 秒：失败快速短路，避免逐个降级时把 6s×N 全吃满
+    const resp = await fetchWithTimeout(apiUrl, {}, 3000);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     const result = apiDef.parse(data);
@@ -1221,7 +1222,7 @@ async function parseVideo(url, opts = {}) {
     console.log('[并行解析] 全部失败或超时:', e.message);
   }
 
-  // 剩余API逐个降级（每个最多6秒）
+  // 剩余API逐个降级（每个最多3秒）
   for (let i = 3; i < availableApis.length; i++) {
     try {
       const result = await fetchAndParse(availableApis[i]);

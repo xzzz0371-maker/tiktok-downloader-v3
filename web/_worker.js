@@ -652,7 +652,7 @@ async function parseViaSources(finalUrl, diag, mode) {
       for (const s of apis) {
         if (sourceInCooldown(s.name)) continue;
         try {
-          const resp = await fetchWithTimeout(s.url, { headers: { 'User-Agent': UA } }, 6000);
+          const resp = await fetchWithTimeout(s.url, { headers: { 'User-Agent': UA } }, 3000);
           if (!resp.ok) { if (diag) errors.push(s.name + ' [fallback]: HTTP ' + resp.status); continue; }
           const r = s.parse(await resp.json());
           if (r?.success) { recordSource(s.name, true); return r; }
