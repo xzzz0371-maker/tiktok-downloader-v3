@@ -1887,20 +1887,48 @@ async function downloadAllVideosInBackground(videos, sendResponse) {
 }
 
 // ============================================================
-//  模块十：右键菜单 + 快捷键
+//  模块十：右键菜单 + 快捷键 + 侧边栏模式（只保留侧边栏）
 // ============================================================
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
-    id: 'download-tiktok-video',
-    title: '下载此视频',
-    contexts: ['page', 'link'],
-    documentUrlPatterns: ['*://*.tiktok.com/*', '*://*.douyin.com/*']
-  });
-  // 侧边栏：点击扩展图标时打开 popup，不自动打开侧边栏
-  if (chrome.sidePanel?.setPanelBehavior) {
-    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
+// 只保留侧边栏：点击扩展图标直接打开浏览器右侧的侧边栏（不再弹小窗）。
+// openPanelOnActionClick 状态在部分浏览器重启后会重置，故后台每次启动都设置一次。
+let _fallbackOnClickedRegistered = false;
+async function enableSidePanelMode() {
+  try {
+    if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+      return;
+    }
+  } catch (e) {
+    console.warn('[侧边栏] setPanelBehavior 失败:', e.message);
   }
+  // 浏览器不支持 sidePanel（Firefox / 老内核 Chromium）→ 点图标改为打开独立窗口兜底
+  if (chrome.action && chrome.action.onClicked && !_fallbackOnClickedRegistered) {
+    _fallbackOnClickedRegistered = true;
+    chrome.action.onClicked.addListener(() => {
+      try {
+        chrome.windows.create({
+          url: chrome.runtime.getURL('popup.html') + '?window=1',
+          type: 'popup', width: 680, height: 860, focused: true
+        });
+      } catch (e) {}
+    });
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  try {
+    chrome.contextMenus.create({
+      id: 'download-tiktok-video',
+      title: '下载此视频',
+      contexts: ['page', 'link'],
+      documentUrlPatterns: ['*://*.tiktok.com/*', '*://*.douyin.com/*']
+    });
+  } catch (e) { console.warn('[菜单] 创建失败:', e.message); }
+  enableSidePanelMode();
 });
+
+// 后台每次启动都确保“点图标=打开侧边栏”（部分浏览器重启后行为会重置）
+enableSidePanelMode();
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const url = info.linkUrl || tab.url;

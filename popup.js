@@ -1119,12 +1119,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }, 1500);
   }
 
-  // ===== 独立窗口模式：自动解析切换后的视频 =====
+  // ===== 独立窗口模式（仅作为“不支持侧边栏的浏览器”兜底入口）=====
   const isWindowMode = new URLSearchParams(window.location.search).get('window') === '1';
   if (isWindowMode) {
     document.body.classList.add('window-mode');
     bringToFrontBtn.style.display = 'flex';
     openWindowBtn.style.display = 'none'; // 独立窗口里不需要再打开独立窗口
+    sidePanelBtn.style.display = 'none'; // 已改为只保留侧边栏，独立窗口不再提供侧边栏入口
 
     // 拉到最前面按钮（先最小化再恢复，确保弹到最上层）
     bringToFrontBtn.addEventListener('click', () => {
@@ -1143,7 +1144,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupAutoParse({ active: true });
   }
 
-  // ===== 侧边栏模式：自动解析切换后的视频 =====
+  // ===== 侧边栏模式（唯一正式界面）：自动解析切换后的视频 =====
   const isSidePanel = window.location.hash === '#sidepanel';
   if (isSidePanel) {
     document.body.classList.add('sidepanel-mode');
@@ -1155,8 +1156,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupAutoParse({ active: true });
   }
 
-  // ===== 弹窗（默认）模式：同样支持自动解析 =====
+  // ===== 直接打开 popup.html（非侧边栏/非窗口，如手动在标签页打开）=====
+  // 已取消工具栏小弹窗：此路径仅兜底，隐藏模式切换按钮，保留解析/下载功能
   if (!isWindowMode && !isSidePanel) {
+    bringToFrontBtn.style.display = 'none';
+    openWindowBtn.style.display = 'none';
+    sidePanelBtn.style.display = 'none';
     setupAutoParse({ active: true });
   }
 });
