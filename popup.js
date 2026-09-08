@@ -55,6 +55,32 @@ let currentDownloads = {};
 // 已下载的视频 ID 集合（用于标记和去重）
 let downloadedIds = new Set();
 
+// ---------- 自动解析冷却：同一目标短时间不重复自动解析 ----------
+// 目的：空白/失效/无视频页面被误判时，只白跑一次（或不再白跑），
+// 避免每次打开弹窗、切换标签都把同一页面反复送去解析浪费时间。
+const AUTO_COOLDOWN_MS = 30 * 60 * 1000; // 30 分钟
+function isAutoInCooldown(url) {
+  try {
+    const m = JSON.parse(localStorage.getItem('td_auto_cooldown') || '{}') || {};
+    const t = m[url];
+    if (t && Date.now() - t < AUTO_COOLDOWN_MS) return true;
+  } catch (e) {}
+  return false;
+}
+function markAutoCooldown(url) {
+  try {
+    const m = JSON.parse(localStorage.getItem('td_auto_cooldown') || '{}') || {};
+    m[url] = Date.now();
+    const keys = Object.keys(m);
+    if (keys.length > 300) {
+      // 防膨胀：最多 300 条，超了丢最早的
+      keys.sort((a, b) => m[a] - m[b]);
+      for (let i = 0; i < keys.length - 300; i++) delete m[keys[i]];
+    }
+    localStorage.setItem('td_auto_cooldown', JSON.stringify(m));
+  } catch (e) {}
+}
+
 // ---------- 工具 ----------
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -986,25 +1012,31 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 否则会与 setupAutoParse 的首次触发重复提交解析。
 
   // ===== 共享：自动解析目标判定（视频页/推荐页/搜索页/标签页/用户主页） =====
+  // 原则：宁可漏解析，也不要拿“空白页/落地页/无效页”去白跑一遍解析（会浪费多路 API + 等待超时）。
   async function getAutoParseTarget(tab) {
     const url = (tab && tab.url) || '';
     if (!url) return '';
     if (!/tiktok\.com|douyin\.com|iesdouyin\.com|tiktokv\.com/.test(url)) return '';
-    // 视频详情页 / 短链：直接用页面 URL
-    if (/\/video\/\d+|\/v\/\d+|v\.douyin\.com|vm\.tiktok\.com/.test(url)) return url;
-    // 搜索页 / 标签页 / 用户主页 / 推荐页 / 首页：提取视口内第一个视频链接
-    if (/\/search|\/tag\/|\/@|foryou|^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)|^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)|^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url)) {
+    // 明确不是视频内容的页面（帮助/版权/登录/下载/直播/广告等），直接排除
+    if (/(^|\/)(about|legal|privacy|terms|community|guidelines|advertise|business|creator|download|login|signup|live)\b/i.test(url)) return '';
+    // 视频详情页 / 短链 / 抖音图集（纯图帖）：直接用页面 URL
+    if (/\/video\/\d+|\/v\/\d+|v\.douyin\.com|vm\.tiktok\.com|douyin\.com\/note\/\d+/.test(url)) return url;
+    // 其它（首页/推荐/搜索/标签/用户主页/发现页）：必须真能取到“视口内的视频链接”才自动解析
+    if (/\/search|\/tag\/|\/@|foryou|discover|^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)|^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)|^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url)) {
       try {
         const res = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: () => {
+            // 页面里一个 /video/ 链接都没有（空白页、加载失败、无内容落地页）→ 直接返回空
             const links = Array.from(document.querySelectorAll('a[href*="/video/"]'));
+            if (!links.length) return '';
             for (const a of links) {
               const r = a.getBoundingClientRect();
-              if (r.width > 0 && r.bottom > 0 && r.top < window.innerHeight) {
-                const m1 = a.href.match(/\/@([^\/?]+)\/video\/(\d+)/);
+              // 需要真实可见且有尺寸，避免取到隐藏/离屏的旧缓存 DOM
+              if (r.width > 20 && r.bottom > 0 && r.top < window.innerHeight) {
+                const m1 = a.href.match(/\/@([^\/?]+)\/video\/(\d{8,})/);
                 if (m1) return 'https://www.tiktok.com/@' + m1[1] + '/video/' + m1[2];
-                const m2 = a.href.match(/\/video\/(\d+)/);
+                const m2 = a.href.match(/\/video\/(\d{8,})/);
                 if (m2) return 'https://www.tiktok.com/video/' + m2[1];
               }
             }
@@ -1013,9 +1045,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
         return (res && res[0] && res[0].result) || '';
       } catch (e) {
-        // chrome.scripting 不可用（Firefox/老内核浏览器）时退化为直接解析页面 URL：
-        // 后台/自建后端会从页面数据里深度解析出视频，精度略低但保证“自动解析”可用
-        return url;
+        // chrome.scripting 不可用：视频详情/图集 URL 已在上方提前返回；
+        // 首页/搜索等页面取不到视口视频就一律不自动解析，避免空白页被白解析
+        return '';
       }
     }
     return '';
@@ -1034,6 +1066,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (!t || !t.url) continue;
           const target = await getAutoParseTarget(t);
           if (target && target !== lastAutoParsedUrl) {
+            // 该目标刚自动解析过（含失败/无效页）→ 进入冷却，跳过，避免反复白解析
+            if (isAutoInCooldown(target)) continue;
             lastAutoParsedUrl = target;
             // 追加而不是覆盖输入框：不弄丢用户已经粘贴/输入的其它链接
             const lines = (urlInput.value || '').split('\n').map(s => s.trim()).filter(Boolean);
@@ -1042,6 +1076,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               urlInput.value = lines.join('\n');
             }
             handleParse(false, true); // 解析中也提交，后台会排队（silent：重复目标时不打扰）
+            markAutoCooldown(target);
             break;
           }
         }
