@@ -67,7 +67,7 @@ console.log('=== 3. 功能链路（插件） ===');
     ['OWN_PARSE_TOKEN 一致', bg.includes("OWN_PARSE_TOKEN = '" + TOKEN + "'") || bg.includes('OWN_PARSE_TOKEN = "' + TOKEN + '"')],
     ['OWN_PROXY_API 存在', bg.includes('OWN_PROXY_API')],
     ['下载链路（直连/代理）', bg.includes('直连逐个尝试') && bg.includes('代理逐个尝试')],
-    ['原画质先取新签名', bg.includes('skipIntercept: true') && bg.includes('freshUrl')],
+    ['下载专用取新签名（更长窗口）', bg.includes('fetchFreshDownloadUrls') && bg.includes('freshUrl')],
     ['直连白名单分流', bg.includes('isDirectFriendlyHost')],
     ['代理探测防坏成功', bg.includes('probeProxyCandidate')],
     ['去 HLS 候选', bg.includes('hlsCandidates')],

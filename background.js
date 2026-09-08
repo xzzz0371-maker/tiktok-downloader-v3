@@ -1621,17 +1621,42 @@ function isDirectFriendlyHost(rawUrl) {
   } catch (e) { return false; }
 }
 
-// A：走代理前先让自建代理 HEAD 探测一次（校验 200/206 + 内容类型），
-// 把“过期签名 / 被风控 / 错误页”的候选拦在发起下载之前，避免白等一轮失败下载。
+// A：走代理前先让自建代理 HEAD 探测一次。返回：
+//   false = 明确是“错误页/过期链接”（200 + html/json/text），跳过该候选；
+//   true  = 看起来可取流；null = 无法判断（HEAD 被 CDN 拒绝但 GET 可能能通）→ 仍发起真实下载试一次，
+//   避免“HEAD 403 其实 GET 能下”的原画质被全部误杀。
 async function probeProxyCandidate(proxyUrl) {
   try {
-    const resp = await fetchWithTimeout(proxyUrl, { method: 'HEAD', headers: { 'Range': 'bytes=0-0' } }, 5000);
-    if (!resp.ok) return false;
+    const resp = await fetchWithTimeout(proxyUrl, { method: 'HEAD', headers: { 'Range': 'bytes=0-0' } }, 6000);
     const ct = (resp.headers.get('content-type') || '').toLowerCase();
-    // 明确是网页/JSON/文本 → 判定为错误页（CDN 对过期链接常返回 200+HTML）
-    if (ct && (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain'))) return false;
-    return true;
-  } catch (e) { return false; }
+    if (resp.ok && ct && (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain'))) {
+      return false; // 200 + 网页/JSON/文本 → 过期签名返回的错误页
+    }
+    return null; // 其它（含 HEAD 非 2xx）：不武断跳过，交给真实下载验证
+  } catch (e) { return null; }
+}
+
+// 下载专用“取新签名”：不走 UI 的 3s/2s 快速窗口，给更充足时间（每 mode 最长 8s）并只保留无水印地址，
+// 提高“原画质下载前拿新鲜链接”的成功率
+async function fetchFreshDownloadUrls(originalUrl) {
+  const modes = ['html', 'api'];
+  if (/\/video\/\d+|\/v\/\d+|\/note\/\d+/.test(originalUrl)) modes.push('item');
+  const tries = modes.map(m => fetchWithTimeout(
+    OWN_PARSE_API + '?url=' + encodeURIComponent(originalUrl) + '&token=' + OWN_PARSE_TOKEN + '&mode=' + m,
+    {}, 8000
+  ).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+   .then(d => (d && d.success) ? d : Promise.reject(new Error('no success'))));
+  let d = null;
+  try { d = await Promise.any(tries); } catch (e) { return { success: false }; }
+  const hd = String(d.hdVideoUrl || '').trim();
+  const v = String(d.videoUrl || '').trim();
+  const cleanHd = looksWatermarked(hd) ? '' : hd;
+  const cleanV = (v && !looksWatermarked(v)) ? v : '';
+  return {
+    success: !!(cleanHd || cleanV),
+    freshUrl: cleanHd || cleanV,
+    freshAltUrl: (cleanV && cleanV !== cleanHd) ? cleanV : ''
+  };
 }
 
 async function downloadSingleVideo(video, language = '') {
@@ -1794,11 +1819,12 @@ async function downloadSingleVideo(video, language = '') {
   let freshAltUrl = '';
   if (isFreshNeeded && video.originalUrl) {
     try {
-      const re = await parseVideo(video.originalUrl, { skipIntercept: true });
-      if (re && re.success) {
-        freshUrl = (re.hdVideoUrl || '').trim();
-        if (re.videoUrl && re.videoUrl !== re.hdVideoUrl) freshAltUrl = (re.videoUrl || '').trim();
-        if (freshUrl) console.log('[下载] 已取得新签名链接');
+      // 下载专用取新签名：不套用 UI 的 3s/2s 快速窗口，给每 mode 最长 8 秒，只保留无水印
+      const fresh = await fetchFreshDownloadUrls(video.originalUrl);
+      if (fresh && fresh.success) {
+        freshUrl = fresh.freshUrl || '';
+        freshAltUrl = fresh.freshAltUrl || '';
+        if (freshUrl) console.log('[下载] 已取得新签名无水印链接');
       }
     } catch (e) {
       console.log('[下载] 获取新签名失败（继续用缓存地址尝试）:', e.message);
@@ -1851,9 +1877,10 @@ async function downloadSingleVideo(video, language = '') {
     if (Date.now() - effortStart >= EFFORT_MS) { effortExhausted = true; break; }
     const proxyUrl = OWN_PROXY_API + encodeURIComponent(cand);
     const probeOk = await probeProxyCandidate(proxyUrl);
-    if (!probeOk) {
-      console.log(`[下载] 代理探测不通过，跳过候选: ${cand.slice(0, 90)}`);
-      lastFail = { success: false, error: '代理探测不通过（链接可能已过期或被风控）' };
+    if (probeOk === false) {
+      // 只有“明确是 200+错误页”才跳过；HEAD 403/无法判断(null)仍真实下载试一次
+      console.log(`[下载] 代理探测确认为错误页，跳过候选: ${cand.slice(0, 90)}`);
+      lastFail = { success: false, error: '该地址为过期/错误页' };
       continue;
     }
     console.log(`[下载] 代理尝试: ${cand.slice(0, 90)}`);
