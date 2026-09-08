@@ -26,6 +26,9 @@ function formatDate(ts) {
 }
 
 const API_TIMEOUT = 10000;
+// 解析两段式窗口：第一段“原画质通道”最多等 5 秒，第二段“第三方 API 全并行”最多 3 秒
+const PARSE_ORIG_MS = 5000;
+const PARSE_API_MS = 3000;
 // 下载候选“首次无进展”判定：30 秒内没有任何字节进展才取消该候选，随后继续下一候选/重试。
 // 只要下载一直在走字节，观察会不断顺延（见 runDownload 的 checkTimeout），不会误杀大文件。
 const FIRST_STALL_CHECK_MS = 30000;
@@ -1103,28 +1106,16 @@ async function parseViaIntercept(finalUrl) {
 }
 
 
-// 自建解析后端 = 一个“接口池”：同一个视频并行请求几种 mode（不同策略组），
+// 自建解析后端“单 mode”请求：
 // html=页面直抓(含抖音 _ROUTER_DATA)、item=TikTok 官方接口、api=第三方源池。
-// 谁先成功用谁的，比单次请求更稳（单次里某策略被风控/失效不影响其它）。
-async function parseViaOwnBackend(finalUrl) {
-  const base = OWN_PARSE_API + '?url=' + encodeURIComponent(finalUrl) + '&token=' + OWN_PARSE_TOKEN;
-  const modes = ['html', 'api'];
-  // 只有带可识别 id 的视频页才有必要跑 TikTok 官方 item 接口
-  if (/\/video\/\d+|\/v\/\d+|\/note\/\d+/.test(finalUrl)) modes.push('item');
-  const requests = modes.map(m => fetchWithTimeout(base + '&mode=' + m, {}, 13000).then(async (resp) => {
-    if (!resp.ok) throw new Error('backend HTTP ' + resp.status);
-    const d = await resp.json();
-    if (!d || !d.success) throw new Error((d && d.error) || 'backend parse failed');
-    return d;
-  }));
-
-  let d;
-  try {
-    d = await Promise.any(requests);
-  } catch (e) {
-    // 全部 mode 失败：把第一个能读到的错误抛出去
-    throw new Error('backend parse failed');
-  }
+// 两段式解析里，html/item 属于第一段“原画质通道”，api 属于第二段“第三方池”。
+async function parseViaOwnBackendMode(finalUrl, mode) {
+  const resp = await fetchWithTimeout(
+    OWN_PARSE_API + '?url=' + encodeURIComponent(finalUrl) + '&token=' + OWN_PARSE_TOKEN + '&mode=' + mode,
+    {}, 6000);
+  if (!resp.ok) throw new Error('backend HTTP ' + resp.status);
+  const d = await resp.json();
+  if (!d || !d.success) throw new Error((d && d.error) || 'backend parse failed');
   return {
     success: true,
     originalUrl: finalUrl,
@@ -1163,75 +1154,59 @@ async function parseVideo(url, opts = {}) {
   }
 
   const encoded = encodeURIComponent(finalUrl);
-  const apis = getApiList(encoded);
-  const availableApis = apis.filter(api => !isApiInCooldown(api.url));
-
-  // ===== 并行解析：本地拦截 + 页面深度解析 + Fetch HTML + 前3个API =====
-  // 谁先成功用谁的，大幅提升速度和成功率
-  const sources = [];
-
-  // 源0：自建解析后端（海外边缘多源轮询，国内可达）
-  sources.push(parseViaOwnBackend(finalUrl).then(r => {
+  const availableApis = getApiList(encoded).filter(api => !isApiInCooldown(api.url));
+  const timeoutOf = (ms, msg) => new Promise((_, reject) => setTimeout(() => reject(new Error(msg)), ms));
+  // 收尾：统一 originalUrl/id，并触发语言/评论异步补充
+  const finalize = (r) => {
+    if (!r || !r.success) throw new Error('parse fail');
     r.originalUrl = finalUrl;
+    r.id = r.id == null || r.id === '' ? String(Date.now()) : String(r.id);
     enrichVideoAsync(r);
     return r;
-  }).catch(e => { throw e; }));
+  };
 
-  // 源1：本地拦截（3秒超时，快速失败）。
-  // 下载重试时跳过它：拦截缓存里往往存着“已经过期/签名失效”的旧链接，
-  // 原画质下载失败多为签名过期，再用旧链接重试只会继续失败。
+  // ===== 第一段（最多 5 秒）：只跑“能出原画质/无水印”的通道 =====
+  // 本地拦截 / 页面深度解析 / FetchHTML / 自建后端 html（抖音直抓）/ TikTok 官方 item。
+  // 任何一个先返回就立即收工 —— 命中时大多 1~3 秒出结果。
+  const origSources = [];
+  origSources.push(parseViaOwnBackendMode(finalUrl, 'html').then(finalize).catch(e => { throw e; }));
+  if (/\/video\/\d+|\/v\/\d+/.test(finalUrl)) {
+    origSources.push(parseViaOwnBackendMode(finalUrl, 'item').then(finalize).catch(e => { throw e; }));
+  }
+  // 下载重试时跳过本地拦截（拦截缓存里常存已过期的旧签名）
   if (!opts.skipIntercept) {
-    sources.push(parseViaIntercept(finalUrl).catch(e => { throw e; }));
+    origSources.push(parseViaIntercept(finalUrl).then(finalize).catch(e => { throw e; }));
+  }
+  origSources.push(parseViaPageDeep(finalUrl).then(finalize).catch(e => { throw e; }));
+  origSources.push(parseViaFetchHtml(finalUrl).then(finalize).catch(e => { throw e; }));
+
+  try {
+    const r1 = await Promise.race([
+      Promise.any(origSources),
+      timeoutOf(PARSE_ORIG_MS, '原画质通道 5 秒超时')
+    ]);
+    if (r1?.success) return r1;
+  } catch (e) {
+    console.log('[解析] 第一段原画质通道未命中（' + PARSE_ORIG_MS + 'ms），切第三方并行:', e.message);
   }
 
-  // 源2：页面深度解析
-  sources.push(parseViaPageDeep(finalUrl).then(r => {
-    r.originalUrl = finalUrl;
-    enrichVideoAsync(r);
-    return r;
-  }).catch(e => { throw e; }));
-
-  // 源3：Fetch HTML 解析
-  sources.push(parseViaFetchHtml(finalUrl).then(r => {
-    r.originalUrl = finalUrl;
-    enrichVideoAsync(r);
-    return r;
-  }).catch(e => { throw e; }));
-
-  // 源4-6：前3个第三方API并行
-  for (let i = 0; i < Math.min(3, availableApis.length); i++) {
-    sources.push(fetchAndParse(availableApis[i]).then(r => {
-      r.originalUrl = finalUrl;
+  // ===== 第二段（3 秒）：第三方公共 API 全部并行 + 自建后端 api 池，谁快用谁 =====
+  const apiSources = [];
+  apiSources.push(parseViaOwnBackendMode(finalUrl, 'api').then(finalize).catch(e => { throw e; }));
+  for (const api of availableApis) {
+    apiSources.push(fetchAndParse(api).then(r => {
       r._parseSource = 'third_party';
-      enrichVideoAsync(r);
-      return r;
+      return finalize(r);
     }).catch(e => { throw e; }));
   }
-
-  // 全部并行 + 12秒总超时，防止某个源卡住导致整体卡死
   try {
-    const result = await Promise.race([
-      Promise.any(sources),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('并行解析总超时')), 12000))
+    const r2 = await Promise.race([
+      Promise.any(apiSources),
+      timeoutOf(PARSE_API_MS, '第三方 API 3 秒超时')
     ]);
-    if (result?.success) {
-      result.id = result.id == null || result.id === '' ? String(Date.now()) : String(result.id);
-      return result;
-    }
+    if (r2?.success) return r2;
   } catch (e) {
-    console.log('[并行解析] 全部失败或超时:', e.message);
-  }
-
-  // 剩余API逐个降级（每个最多3秒）
-  for (let i = 3; i < availableApis.length; i++) {
-    try {
-      const result = await fetchAndParse(availableApis[i]);
-      result.originalUrl = finalUrl;
-      result._parseSource = 'third_party';
-      enrichVideoAsync(result);
-      result.id = result.id == null || result.id === '' ? String(Date.now()) : String(result.id);
-      return result;
-    } catch (e) { continue; }
+    console.log('[解析] 第二段第三方也全挂:', e.message);
   }
 
   return { success: false, originalUrl: finalUrl, error: '所有解析源均失败' };
@@ -1283,11 +1258,16 @@ async function extractPageMeta(tabId) {
 }
 
 // ============================================================
-//  模块六：后台解析队列（支持排队追加）
+//  模块六：后台解析队列 —— 3 个并发 worker 的共享池
+//  队列里的 URL 不分任务先后，谁空谁领，同时最多解析 PARSE_POOL 个视频，
+//  避免“一条任务跑完才跑下一条”造成的一个一个排队解析
 // ============================================================
-let parseTask = null;
-let parseQueue = []; // 等待中的解析任务 [{urls, allowDuplicate}]
-let stopParseRequested = false; // 用户请求停止解析
+let parseTask = null;        // 池当前进度对象（供 popup 轮询/展示）
+let parsePending = [];       // 待解析项 [{url, allowDuplicate}]，未被 worker 领走的
+let stopParseRequested = false;
+let poolRunning = false;     // 是否已有池在工作（防并发起多个池）
+const PARSE_POOL = 3;        // 同时解析的视频数
+const POOL_IDLE_MS = 800;    // 池空闲多久算本批结束（给新提交一个合并窗口）
 
 async function loadCachedVideos() {
   const result = await chrome.storage.local.get('cachedVideos');
@@ -1298,158 +1278,145 @@ async function saveCachedVideos(videos) {
   await chrome.storage.local.set({ cachedVideos: videos });
 }
 
-async function updateParseProgress(patch, task) {
-  const current = task || parseTask;
-  if (!current) return;
-  Object.assign(current, patch);
-  await chrome.storage.local.set({ parseProgress: { ...current, queueLength: parseQueue.length } });
-}
-
-// 处理队列中的下一个任务
-function processNextParseTask() {
-  if (parseTask?.status === 'running') return;
-  if (parseQueue.length === 0) return;
-  const next = parseQueue.shift();
-  startBackgroundParse(next.urls, next.allowDuplicate);
+function writeParseProgress(task) {
+  if (!task) return Promise.resolve();
+  return chrome.storage.local.set({ parseProgress: { ...task, queueLength: parsePending.length } }).catch(() => {});
 }
 
 async function startBackgroundParse(urls, allowDuplicate = false) {
-  // 只要已有任务存在（运行中，或已 done 但尚未被上一个任务收尾清空），一律先排队，
-  // 由上一个任务收尾后统一启动，避免两个并发任务互相覆盖 parseTask，
-  // 导致收尾逻辑把新任务的 parseTask 置 null / 写入错误状态（旧 bug）。
-  if (parseTask) {
-    parseQueue.push({ urls, allowDuplicate });
-    return { success: true, queued: true, total: urls.length, queueLength: parseQueue.length };
+  const list = (Array.isArray(urls) ? urls : []).map(u => String(u).trim()).filter(Boolean);
+  if (list.length === 0) return { success: false, reason: '没有有效链接' };
+  const hadRunning = !!(parseTask && parseTask.status === 'running');
+  const items = list.map(url => ({ url, allowDuplicate: !!allowDuplicate }));
+  parsePending.push(...items);
+  // 池正在运行：直接并入当前任务（total 动态增长），由空闲 worker 接着领
+  if (parseTask && parseTask.status === 'running') {
+    parseTask.total += items.length;
+    writeParseProgress(parseTask);
   }
+  ensurePool();
+  return { success: true, queued: hadRunning, total: list.length, queueLength: parsePending.length };
+}
 
+function ensurePool() {
+  if (poolRunning) return;
+  poolRunning = true;
+  (async () => {
+    try {
+      while (parsePending.length) {
+        await pumpUntilIdle();
+      }
+    } finally {
+      poolRunning = false;
+      if (parsePending.length) ensurePool(); // 收尾瞬间又来了新任务，补跑
+    }
+  })();
+}
+
+// 跑一批：3 个 worker 同时从 parsePending 领 URL，直到队列空 + 空闲一段时间才算本批结束
+async function pumpUntilIdle() {
   const task = {
-    id: Date.now(), total: urls.length, completed: 0,
-    success: 0, failed: 0, skipped: 0, status: 'running', startedAt: Date.now()
+    id: Date.now(), total: parsePending.length, completed: 0,
+    success: 0, failed: 0, skipped: 0, status: 'running', startedAt: Date.now(), stopped: false
   };
   parseTask = task;
   stopParseRequested = false;
-  await chrome.storage.local.set({ parseProgress: { ...task, queueLength: parseQueue.length } });
+  const results = [];
+  const failedUrls = [];
+  let skippedCount = 0;
+  let completed = 0;
+  // 统一字符串 id：历史缓存里可能存在 number/string 混存或超过 2^53 丢失精度的 id
+  const existing = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
+  const persist = () => writeParseProgress(task);
 
-  (async () => {
-    try {
-    const results = [];
-    const failedUrls = [];
-    let skippedCount = 0;
-    let completed = 0;
-    // 统一字符串 id：历史缓存里可能存在 number/string 混存或超过 2^53 丢失精度的 id
-    const existing = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
-    const concurrency = 8;
-    let index = 0;
+  // 带重试的解析函数
+  async function parseWithRetry(url, maxRetries = 1) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await Promise.race([
+          parseVideo(url),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('解析超时')), 60000))
+        ]);
+        if (result.success) return result;
+        if (attempt < maxRetries) await sleep(500);
+      } catch (e) {
+        if (attempt < maxRetries) await sleep(500);
+        else throw e;
+      }
+    }
+    return { success: false };
+  }
 
-    // 带重试的解析函数
-    async function parseWithRetry(url, maxRetries = 1) {
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-          const result = await Promise.race([
-            parseVideo(url),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('解析超时')), 120000))
-          ]);
-          if (result.success) return result;
-          // 失败后等待 500ms 再重试
-          if (attempt < maxRetries) await new Promise(r => setTimeout(r, 500));
-        } catch (e) {
-          if (attempt < maxRetries) await new Promise(r => setTimeout(r, 500));
-          else throw e;
+  let lastPullAt = Date.now();
+  async function worker() {
+    while (!stopParseRequested) {
+      const item = parsePending.shift();
+      if (!item) {
+        if (Date.now() - lastPullAt > POOL_IDLE_MS) return; // 空转超时，本批结束
+        await sleep(60);
+        continue;
+      }
+      lastPullAt = Date.now();
+      const { url, allowDuplicate } = item;
+      // URL 级去重：该链接之前已成功解析过（本批结果或历史缓存）且允许跳过时，
+      // 直接跳过、不发网络请求（避免旧链接被反复重解析）
+      if (!allowDuplicate) {
+        const alreadyParsed = existing.some(v => v.originalUrl === url)
+                           || results.some(v => v.originalUrl === url);
+        if (alreadyParsed) {
+          skippedCount++;
+          completed++;
+          await persist();
+          continue;
         }
       }
-      return { success: false };
-    }
-
-    async function worker() {
-      while (index < urls.length && !stopParseRequested) {
-        const i = index++;
-        const url = urls[i];
-        // URL 级去重：该链接之前已成功解析过（本批结果或历史缓存）且本次允许跳过时，
-        // 直接跳过、不发网络请求 —— 否则每次新增解析都会把输入框里旧的 10 条链接再
-        // 重新解析一遍（旧 bug：先请求后按 id 跳过，白白消耗时间/流量并触发列表刷新）。
-        if (!allowDuplicate) {
-          const alreadyParsed = existing.some(v => v.originalUrl === url)
-                             || results.some(v => v.originalUrl === url);
-          if (alreadyParsed) {
-            skippedCount++;
-            completed++;
-            await updateParseProgress({
-              completed, success: results.length,
-              failed: failedUrls.length, skipped: skippedCount
-            }, task);
-            continue;
+      try {
+        const result = await parseWithRetry(url);
+        if (result.success) {
+          const vid = String(result.id);
+          const exists = existing.some(v => v.id === vid);
+          const dupInResults = results.some(v => String(v.id) === vid);
+          if (!allowDuplicate && exists) skippedCount++;
+          else if (!dupInResults) {
+            result.id = vid;
+            if (!result.originalUrl) result.originalUrl = url;
+            results.push(result);
           }
+        } else {
+          failedUrls.push(url);
         }
-        try {
-          const result = await parseWithRetry(url);
-          if (result.success) {
-            const vid = String(result.id);
-            const exists = existing.some(v => v.id === vid);
-            const dupInResults = results.some(v => String(v.id) === vid);
-            if (!allowDuplicate && exists) skippedCount++;
-            else if (!dupInResults) {
-              result.id = vid;
-              if (!result.originalUrl) result.originalUrl = url;
-              results.push(result);
-            }
-          } else {
-            failedUrls.push(url);
-          }
-        } catch (e) { failedUrls.push(url); }
+      } catch (e) { failedUrls.push(url); }
 
-        completed++;
-        await updateParseProgress({
-          completed, success: results.length,
-          failed: failedUrls.length, skipped: skippedCount
-        }, task);
-      }
+      completed++;
+      await persist();
     }
+  }
 
-    const workers = [];
-    for (let w = 0; w < Math.min(concurrency, urls.length); w++) workers.push(worker());
-    await Promise.all(workers);
+  const workers = [];
+  for (let w = 0; w < PARSE_POOL; w++) workers.push(worker());
+  await Promise.all(workers);
 
-    // 合并到缓存（历史缓存 id 统一为字符串，新结果放最前）
-    let allVideos = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
-    for (let i = results.length - 1; i >= 0; i--) allVideos.unshift(results[i]);
-    // 缓存上限：最多保留 200 条，防止爆存储
-    if (allVideos.length > 200) allVideos = allVideos.slice(0, 200);
-    await saveCachedVideos(allVideos);
+  // 合并到缓存（历史缓存 id 统一为字符串，新结果放最前）
+  let allVideos = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
+  for (let i = results.length - 1; i >= 0; i--) allVideos.unshift(results[i]);
+  if (allVideos.length > 200) allVideos = allVideos.slice(0, 200);
+  try { await saveCachedVideos(allVideos); } catch (e) {}
 
-    // 异步获取文件大小（用 id 查找，避免 index 错位）
-    results.forEach((v) => fetchVideoSizeInBackground(v));
+  // 异步获取文件大小（用 id 查找，避免 index 错位）
+  results.forEach((v) => fetchVideoSizeInBackground(v));
 
-    task.status = 'done';
-    task.completedAt = Date.now();
-    await chrome.storage.local.set({ parseProgress: { ...task, queueLength: parseQueue.length } });
+  task.status = 'done';
+  task.completedAt = Date.now();
+  await writeParseProgress(task);
 
-    let msg = `已解析 ${results.length} 个视频`;
-    if (skippedCount > 0) msg += `，跳过 ${skippedCount} 个已存在`;
-    if (failedUrls.length > 0) msg += `，${failedUrls.length} 个失败`;
-    const title = task.stopped ? '⏹ 已停止解析' : (results.length > 0 ? '✅ 解析完成' : '⚠️ 解析完成');
+  let msg = `已解析 ${results.length} 个视频`;
+  if (skippedCount > 0) msg += `，跳过 ${skippedCount} 个已存在`;
+  if (failedUrls.length > 0) msg += `，${failedUrls.length} 个失败`;
+  const title = task.stopped ? '⏹ 已停止解析' : (results.length > 0 ? '✅ 解析完成' : '⚠️ 解析完成');
+  showNotification({ type: 'basic', iconUrl: 'icons/icon128.png', title, message: msg, priority: 2 });
 
-    showNotification({
-      type: 'basic', iconUrl: 'icons/icon128.png',
-      title, message: msg, priority: 2
-    });
-    } finally {
-      // 无论成功、停止还是意外异常：只有 parseTask 仍指向本任务时才清空，
-      // 防止误清随后启动的新任务；并驱动队列继续运行，避免 parseTask 永久卡住。
-      // 若中途异常退出（非正常 done），补写终止态，防止 popup 一直停留在“解析中”
-      if (parseTask === task) {
-        if (task.status !== 'done') {
-          task.status = 'done';
-          task.completedAt = Date.now();
-          task.error = true;
-          chrome.storage.local.set({ parseProgress: { ...task, queueLength: parseQueue.length } }).catch(() => {});
-        }
-        parseTask = null;
-        setTimeout(processNextParseTask, 300);
-      }
-    }
-  })();
-
-  return { success: true, taskId: task.id, total: urls.length };
+  // 只有 parseTask 仍指向本任务时才清空，防止误清随后启动的新池
+  if (parseTask === task) parseTask = null;
 }
 
 // 后台获取文件大小（按 video.id 查找，修复 index 错位 bug）
@@ -2088,11 +2055,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'get-parse-progress') {
     if (parseTask) {
-      sendResponse({ ...parseTask, queueLength: parseQueue.length });
+      sendResponse({ ...parseTask, queueLength: parsePending.length });
     } else {
       chrome.storage.local.get('parseProgress').then(r => {
         const progress = r.parseProgress || null;
-        if (progress) progress.queueLength = parseQueue.length;
+        if (progress) progress.queueLength = parsePending.length;
         sendResponse(progress);
       });
     }
@@ -2100,11 +2067,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'stop-parse') {
-    // 停止当前解析任务：只做标记 + 清空排队，不要直接把 parseTask 置 null。
-    // 后台收尾的异步任务结束后仍会写 parseTask.status；直接置 null 会让它在
-    // 收尾处抛 TypeError（旧 bug），并可能让随后启动的新任务被旧收尾逻辑误清。
+    // 停止当前解析：打标记 + 清空还没被 worker 领取的待解析项。
     stopParseRequested = true;
-    parseQueue = []; // 立即清空排队任务
+    parsePending = []; // 立即清空排队项
     if (parseTask?.status === 'running') {
       parseTask.stopped = true;
       parseTask.status = 'done';
@@ -2131,8 +2096,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: false, reason: '无视频ID' });
       return true;
     }
-    // 队列溢出防护：最多 20 个任务排队
-    const totalQueued = (parseTask ? 1 : 0) + parseQueue.length;
+    // 队列溢出防护：最多 20 个视频排队（3 个正在解析 + 17 个待解析）
+    const totalQueued = parsePending.length + (parseTask?.status === 'running' ? PARSE_POOL : 0);
     if (totalQueued >= 20) {
       sendResponse({ success: false, reason: '队列已满' });
       return true;
