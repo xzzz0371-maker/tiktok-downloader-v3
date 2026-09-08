@@ -3,7 +3,27 @@
 // 新增：网络请求拦截、页面深度解析、下载进度广播、下载逻辑优化
 // v3.1：公共函数抽离到 common.js、API熔断、下载速度、下载历史、拦截持久化
 // ============================================================
-import { formatLikes, formatDate } from './common.js';
+// 说明：不再以 ES module 方式 import（去掉 manifest 的 type=module），
+// 两个格式化小函数直接内联，保证在 Firefox / 部分老内核浏览器也能加载 SW。
+
+// ---------- 点赞数格式化（与 common.js 保持一致） ----------
+function formatLikes(n) {
+  if (!n || n <= 0) return '';
+  if (n < 1000) return String(n);
+  if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+  if (n < 100000000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + 'W';
+  return (n / 100000000).toFixed(1).replace(/\.0$/, '') + '亿';
+}
+
+// ---------- 日期格式化（与 common.js 保持一致） ----------
+function formatDate(ts) {
+  if (!ts) return '';
+  const date = new Date(ts < 1e12 ? ts * 1000 : ts);
+  if (isNaN(date.getTime())) return '';
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${m}.${d}`;
+}
 
 const API_TIMEOUT = 10000;
 const DOWNLOAD_TIMEOUT = 120000; // 下载超时延长到 120 秒
@@ -58,11 +78,14 @@ function isVideoCdnUrl(url) {
 }
 
 // 节流写入 storage.session：最多每 1 秒写一次，避免频繁 IO
+// （storage.session 为 Chrome 102+/Edge 新增；Firefox 与老内核没有该 API，
+//   缺失时仅跳过持久化，不影响拦截功能本身）
 let _capturedSaveTimer = null;
 function saveCapturedToSession() {
   if (_capturedSaveTimer) return;
   _capturedSaveTimer = setTimeout(() => {
     _capturedSaveTimer = null;
+    if (!chrome.storage || !chrome.storage.session) return;
     const obj = {};
     for (const [k, v] of capturedVideoUrls) obj[k] = v;
     chrome.storage.session.set({ capturedVideoUrls: obj }).catch(() => {});
@@ -72,6 +95,7 @@ function saveCapturedToSession() {
 // SW 启动时从 storage.session 恢复拦截缓存
 (async () => {
   try {
+    if (!chrome.storage || !chrome.storage.session) return;
     const stored = await chrome.storage.session.get('capturedVideoUrls');
     if (stored.capturedVideoUrls) {
       for (const [tabId, data] of Object.entries(stored.capturedVideoUrls)) {
@@ -1318,8 +1342,25 @@ async function startBackgroundParse(urls, allowDuplicate = false) {
     async function worker() {
       while (index < urls.length && !stopParseRequested) {
         const i = index++;
+        const url = urls[i];
+        // URL 级去重：该链接之前已成功解析过（本批结果或历史缓存）且本次允许跳过时，
+        // 直接跳过、不发网络请求 —— 否则每次新增解析都会把输入框里旧的 10 条链接再
+        // 重新解析一遍（旧 bug：先请求后按 id 跳过，白白消耗时间/流量并触发列表刷新）。
+        if (!allowDuplicate) {
+          const alreadyParsed = existing.some(v => v.originalUrl === url)
+                             || results.some(v => v.originalUrl === url);
+          if (alreadyParsed) {
+            skippedCount++;
+            completed++;
+            await updateParseProgress({
+              completed, success: results.length,
+              failed: failedUrls.length, skipped: skippedCount
+            }, task);
+            continue;
+          }
+        }
         try {
-          const result = await parseWithRetry(urls[i]);
+          const result = await parseWithRetry(url);
           if (result.success) {
             const vid = String(result.id);
             const exists = existing.some(v => v.id === vid);
@@ -1327,12 +1368,13 @@ async function startBackgroundParse(urls, allowDuplicate = false) {
             if (!allowDuplicate && exists) skippedCount++;
             else if (!dupInResults) {
               result.id = vid;
+              if (!result.originalUrl) result.originalUrl = url;
               results.push(result);
             }
           } else {
-            failedUrls.push(urls[i]);
+            failedUrls.push(url);
           }
-        } catch (e) { failedUrls.push(urls[i]); }
+        } catch (e) { failedUrls.push(url); }
 
         completed++;
         await updateParseProgress({

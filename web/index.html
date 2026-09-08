@@ -460,7 +460,7 @@
   var lastInput = '';
   async function parseViaOwnBackend(rawUrl){
     try{
-      var r = await fetch(OWN_PARSE_API + '?url=' + encodeURIComponent(rawUrl) + '&token=' + OWN_TOKEN, { signal: AbortSignal.timeout(15000) });
+      var r = await fetchTimeout(OWN_PARSE_API + '?url=' + encodeURIComponent(rawUrl) + '&token=' + OWN_TOKEN, 15000);
       if(!r.ok) return null;
       var d = await r.json();
       if(!d || !d.success) return null;
@@ -498,6 +498,15 @@
     return fetch(url, { signal:ctrl.signal, headers:{ 'Accept':'application/json,text/html,*/*' } })
       .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
       .finally(function(){ clearTimeout(t); });
+  }
+
+  // 带超时的 fetch：不用 AbortSignal.timeout（老内核浏览器不支持），手动 AbortController 更兼容
+  function fetchTimeout(url, ms){
+    var ctrl = new AbortController();
+    var t = setTimeout(function(){ ctrl.abort(); }, ms || 15000);
+    var p = fetch(url, { signal: ctrl.signal, headers:{ 'Accept':'application/json,text/html,*/*' } });
+    p.finally(function(){ clearTimeout(t); });
+    return p;
   }
 
   function un(s){

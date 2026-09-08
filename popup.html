@@ -4,6 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TikTok下载器</title>
+  <script>
+    // 首屏防主题闪烁：CSS 加载/渲染前先按上次主题锁定配色（浅色系统下默认深色会闪一下）
+    try { document.documentElement.className = localStorage.getItem('td_theme') === 'light' ? 'force-light' : 'force-dark'; } catch (e) {}
+  </script>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -93,6 +97,6 @@
       </div>
     </div>
   </div>
-  <script type="module" src="popup.js"></script>
+  <script src="popup.js"></script>
 </body>
 </html>

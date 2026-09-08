@@ -38,6 +38,33 @@
     --text-muted: #9999bb;
   }
 }
+/* 主题防闪烁：<html> 带 force-light / force-dark 类时强制对应配色。
+   popup.html 首屏内联脚本在渲染前按 localStorage 记忆打类，避免弹窗打开瞬间
+   浅色系统下先亮一下再切到深色（旧版每次打开都会闪一下）。 */
+html.force-dark {
+  --bg: #0a0a14;
+  --bg-gradient: linear-gradient(160deg, #0d0d1a 0%, #0a0a14 50%, #111125 100%);
+  --bg-card: rgba(255, 255, 255, 0.04);
+  --bg-card-hover: rgba(255, 255, 255, 0.08);
+  --bg-input: rgba(255, 255, 255, 0.03);
+  --border: rgba(255, 255, 255, 0.06);
+  --border-hover: rgba(255, 255, 255, 0.12);
+  --text: #f0f0f5;
+  --text-secondary: #9898b8;
+  --text-muted: #5a5a7a;
+}
+html.force-light {
+  --bg: #f0f0f5;
+  --bg-gradient: linear-gradient(160deg, #f5f5fa 0%, #f0f0f5 50%, #e8e8f0 100%);
+  --bg-card: rgba(255, 255, 255, 0.7);
+  --bg-card-hover: rgba(255, 255, 255, 0.95);
+  --bg-input: rgba(0, 0, 0, 0.025);
+  --border: rgba(0, 0, 0, 0.06);
+  --border-hover: rgba(0, 0, 0, 0.12);
+  --text: #1a1a2e;
+  --text-secondary: #666688;
+  --text-muted: #9999bb;
+}
 body {
   width: 520px;
   max-width: 100vw;

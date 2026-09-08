@@ -41,6 +41,14 @@ const previewAuthor = document.getElementById('previewAuthor');
 let parsedVideos = [];
 let currentTheme = 'auto';
 
+// 尽早应用记忆主题（applyTheme 是函数声明，可提升调用）：popup.html 首屏内联脚本
+// 已按 localStorage 打了 force-* 类防闪烁，这里在 DOMContentLoaded 之前再同步一次，
+// 保证 JS 状态（themeToggle 图标等）与配色一致。
+try {
+  const storedTheme = localStorage.getItem('td_theme');
+  if (storedTheme === 'dark' || storedTheme === 'light') applyTheme(storedTheme);
+} catch (e) {}
+
 // 当前下载进度映射：videoId -> { state, bytesReceived, totalBytes, percent }
 let currentDownloads = {};
 
@@ -157,7 +165,8 @@ function renderCard(video, index) {
     `;
     card.querySelector('.btn-delete-corner')?.addEventListener('click', (e) => {
       e.stopPropagation();
-      deleteVideo(index);
+      // 用实时的 dataset.index（列表头部插入新卡后索引会重排）
+      deleteVideo(Number(card.dataset.index));
     });
     videoList.appendChild(card);
     return;
@@ -208,11 +217,11 @@ function renderCard(video, index) {
 
   card.querySelector('.btn-delete-corner')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    deleteVideo(index);
+    deleteVideo(Number(card.dataset.index));
   });
-  card.querySelector('[data-dl]')?.addEventListener('click', () => handleDownload(index));
+  card.querySelector('[data-dl]')?.addEventListener('click', () => handleDownload(Number(card.dataset.index)));
   card.querySelectorAll('[data-preview]').forEach(el => {
-    el.addEventListener('click', () => openPreview(parseInt(el.dataset.preview)));
+    el.addEventListener('click', () => openPreview(Number(card.dataset.index)));
   });
 
   videoList.appendChild(card);
@@ -308,27 +317,52 @@ function updateAllCardsProgress() {
 
 // ---------- 刷新列表（增量渲染，避免整表重建导致抽搐/闪烁） ----------
 // force=true 时强制全量重建（删除/排序变化等场景）
+function sameIds(a, b) {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+// 列表结构变化后按 DOM 顺序重排卡片索引（data-index 是删除/预览/下载的事件来源）
+function renumberCards() {
+  const cards = videoList.querySelectorAll('.video-card');
+  for (let i = 0; i < cards.length; i++) cards[i].dataset.index = String(i);
+}
+
 function refreshVideoList(force) {
   if (!force) {
-    const existing = videoList.querySelectorAll('.video-card');
+    const existing = Array.from(videoList.querySelectorAll('.video-card'));
     const oldCount = existing.length;
     if (oldCount > 0) {
-      const domIds = Array.from(existing).map(c => c.dataset.videoId);
+      const domIds = existing.map(c => c.dataset.videoId);
       const newIds = parsedVideos.map(v => v.id);
-      // 数量相同且 id 序列一致：完全跳过（打开插件/状态刷新时避免重复全量重建导致闪烁）
-      if (parsedVideos.length === oldCount && newIds.every((id, i) => id === domIds[i])) return;
-      // 新列表只是旧列表的“尾部追加”（头部序列一致）时才增量渲染，保留已有卡片 DOM。
-      // 注意：后台合并缓存时新结果是 unshift 到最前面的，若头部不一致必须整表重建，
-      // 否则会漏掉新视频并把旧卡片错误复用（出现重复卡片）。
-      if (parsedVideos.length > oldCount && newIds.slice(0, oldCount).every((id, i) => id === domIds[i])) {
-        for (let i = oldCount; i < parsedVideos.length; i++) {
-          renderCard(parsedVideos[i], i);
+      // 完全一致：跳过（打开插件/状态刷新时避免重复全量重建导致闪烁）
+      if (sameIds(newIds, domIds)) return;
+
+      if (newIds.length > oldCount) {
+        // 情况A：旧列表整体保留在尾部（后台把新结果 unshift 到最前）→ 只在前方插入新卡，
+        // 旧卡片 DOM/封面不重建，从根源消除“新解析一个视频→整表重画→闪烁”问题
+        if (sameIds(newIds.slice(newIds.length - oldCount), domIds)) {
+          const firstOld = existing[0];
+          const addCount = newIds.length - oldCount;
+          for (let i = 0; i < addCount; i++) {
+            renderCard(parsedVideos[i], i); // 先 append 到末尾
+            videoList.insertBefore(videoList.lastElementChild, firstOld); // 再移到最前、保持顺序
+          }
+          renumberCards();
+          updateToolbar();
+          return;
         }
-        updateToolbar();
-        return;
+        // 情况B：旧列表整体保留在头部（尾部追加）→ 只追加新卡
+        if (sameIds(newIds.slice(0, oldCount), domIds)) {
+          for (let i = oldCount; i < newIds.length; i++) {
+            renderCard(parsedVideos[i], i);
+          }
+          updateToolbar();
+          return;
+        }
       }
     }
   }
+  // 其它情况（删除/排序变化/首尾都不匹配等）→ 整表重建
   videoList.innerHTML = '';
   parsedVideos.forEach((v, i) => renderCard(v, i));
   updateToolbar();
@@ -565,6 +599,8 @@ function hideStatus() {
 // ---------- 主题 ----------
 function applyTheme(theme) {
   currentTheme = theme;
+  // 镜像到 localStorage，供 popup.html 首屏内联脚本在渲染前锁定配色（防打开闪烁）
+  try { localStorage.setItem('td_theme', theme); } catch (e) {}
   const root = document.documentElement;
   if (theme === 'dark') {
     root.style.setProperty('--bg', '#0a0a14');
@@ -617,23 +653,45 @@ async function checkParseProgress() {
   });
 }
 
-async function handleParse(allowDuplicate = false) {
+async function handleParse(allowDuplicate = false, silent = false) {
   const text = urlInput.value.trim();
-  if (!text) { showToast('请粘贴链接'); return; }
+  if (!text) { if (!silent) showToast('请粘贴链接'); return; }
   const urls = text.match(/https?:\/\/[^\s]+/g) || [];
   const tiktokUrls = urls.filter(u => u.includes('tiktok.com') || u.includes('douyin.com'));
-  if (tiktokUrls.length === 0) { showToast('未找到有效链接'); return; }
+  if (tiktokUrls.length === 0) { if (!silent) showToast('未找到有效链接'); return; }
+
+  // 过滤掉已经成功解析过的链接：输入框里通常保留着之前解析过的历史链接，
+  // 如果不过滤，每次“解析一条新视频”都会把前面所有链接重新提交给后台再解析一遍。
+  const known = new Set(
+    parsedVideos
+      .filter(v => v.success && v.originalUrl)
+      .map(v => v.originalUrl.replace(/\/+$/, ''))
+  );
+  const seen = new Set();
+  const freshUrls = [];
+  for (const u of tiktokUrls) {
+    const key = u.replace(/\/+$/, '');
+    if (seen.has(key) || known.has(key)) continue;
+    seen.add(key);
+    freshUrls.push(u);
+  }
+  const dupCount = tiktokUrls.length - freshUrls.length;
+  if (freshUrls.length === 0) {
+    if (!silent) showToast(dupCount > 0 ? '这些链接之前都已解析过' : '未找到新的链接');
+    return;
+  }
 
   chrome.runtime.sendMessage({
     type: 'start-parse',
-    urls: tiktokUrls,
+    urls: freshUrls,
     allowDuplicate: allowDuplicate
   }, (response) => {
     if (response && response.success) {
+      const skipMsg = dupCount > 0 ? `（已跳过 ${dupCount} 个之前解析过的链接）` : '';
       if (response.queued) {
-        showToast(`📋 已加入队列，前面还有 ${response.queueLength - 1} 个任务，共 ${response.total} 个视频`);
+        showToast(`📋 已加入队列，前面还有 ${response.queueLength - 1} 个任务，共 ${response.total} 个视频${skipMsg}`);
       } else {
-        showToast(`🚀 已开始解析 ${response.total} 个视频，完成后会通知你`);
+        showToast(`🚀 已开始解析 ${response.total} 个视频${skipMsg}`);
       }
       parseBtn.disabled = true;
       parseBtn.style.opacity = '0.5';
@@ -675,7 +733,8 @@ async function clearAll() {
 //  事件绑定
 // ============================================================
 function setupEvents() {
-  parseBtn.addEventListener('click', () => handleParse(true));
+  // 手动解析按钮：与自动解析一致不允许重复添加，避免缓存里反复堆积重复项
+  parseBtn.addEventListener('click', () => handleParse(false));
   clearBtn.addEventListener('click', clearAll);
   grabBtn.addEventListener('click', grabCurrentPageUrl);
   stopParseBtn.addEventListener('click', () => {
@@ -695,7 +754,7 @@ function setupEvents() {
   });
 
   urlInput.addEventListener('keydown', (e) => {
-    if (e.ctrlKey && e.key === 'Enter') handleParse(true);
+    if (e.ctrlKey && e.key === 'Enter') handleParse(false);
   });
 
   previewClose.addEventListener('click', closePreview);
@@ -903,7 +962,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
         });
         return (res && res[0] && res[0].result) || '';
-      } catch (e) { return ''; }
+      } catch (e) {
+        // chrome.scripting 不可用（Firefox/老内核浏览器）时退化为直接解析页面 URL：
+        // 后台/自建后端会从页面数据里深度解析出视频，精度略低但保证“自动解析”可用
+        return url;
+      }
     }
     return '';
   }
@@ -928,7 +991,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               lines.push(target);
               urlInput.value = lines.join('\n');
             }
-            handleParse(false); // 解析中也提交，后台会排队
+            handleParse(false, true); // 解析中也提交，后台会排队（silent：重复目标时不打扰）
             break;
           }
         }
