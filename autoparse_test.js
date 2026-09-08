@@ -12,7 +12,7 @@ const vm = require('vm');
 const TEST_URL = 'https://www.tiktok.com/@qaom9twgj8/video/7657172908623645969';
 const SEARCH_URL = 'https://www.tiktok.com/search?q=nose';
 const OTHER_URL = 'https://github.com/xzzz0371-maker/tiktok-downloader-v3';
-const VERSION = '4.1.4';
+const VERSION = '4.1.5';
 
 // ---------- mock 元素 ----------
 function makeEl(tag) {

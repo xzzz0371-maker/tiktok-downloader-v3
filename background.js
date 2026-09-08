@@ -1140,7 +1140,7 @@ async function parseViaOwnBackend(finalUrl) {
   };
 }
 
-async function parseVideo(url) {
+async function parseVideo(url, opts = {}) {
   let finalUrl = url.trim();
 
   // 短链接展开（缩短超时，快速失败）
@@ -1171,8 +1171,12 @@ async function parseVideo(url) {
     return r;
   }).catch(e => { throw e; }));
 
-  // 源1：本地拦截（3秒超时，快速失败）
-  sources.push(parseViaIntercept(finalUrl).catch(e => { throw e; }));
+  // 源1：本地拦截（3秒超时，快速失败）。
+  // 下载重试时跳过它：拦截缓存里往往存着“已经过期/签名失效”的旧链接，
+  // 原画质下载失败多为签名过期，再用旧链接重试只会继续失败。
+  if (!opts.skipIntercept) {
+    sources.push(parseViaIntercept(finalUrl).catch(e => { throw e; }));
+  }
 
   // 源2：页面深度解析
   sources.push(parseViaPageDeep(finalUrl).then(r => {
@@ -1698,15 +1702,27 @@ async function downloadSingleVideo(video, language = '') {
           resolve({ success: false, error: errMsg });
         }
       });
-      setTimeout(() => {
+      // 超时策略：只在“完全无进展”时才取消。原画质/高清大文件动辄几百 MB，
+      // 固定 120 秒一到就取消会把正在正常传输的大文件误杀（原画质失败高发原因之一）。
+      // 只要 60 秒内有字节进展，就一直顺延观察，不打断下载。
+      const STALL_MS = 60000;
+      const checkTimeout = () => {
         if (settled) return;
+        const cur = downloadProgressMap.get(downloadId);
+        const lastActivity = (cur && cur.lastTime) || 0;
+        if (lastActivity && Date.now() - lastActivity < STALL_MS) {
+          // 仍在传输 → 继续观察
+          setTimeout(checkTimeout, STALL_MS);
+          return;
+        }
         settled = true;
         chrome.downloads.onChanged.removeListener(listener);
         chrome.downloads.cancel(downloadId, () => {});
-        updateDownloadProgress(downloadId, { state: 'error', error: '下载超时（已取消）' });
+        updateDownloadProgress(downloadId, { state: 'error', error: '下载超时（无进展已取消）' });
         setTimeout(() => removeDownloadProgress(downloadId), 8000);
-        resolve({ success: false, error: '下载超时' });
-      }, DOWNLOAD_TIMEOUT);
+        resolve({ success: false, error: '下载超时（无进展）' });
+      };
+      setTimeout(checkTimeout, DOWNLOAD_TIMEOUT);
     });
   }
 
@@ -1717,13 +1733,17 @@ async function downloadSingleVideo(video, language = '') {
     return { ...result, url };
   }
 
-  // 尝试2：重新解析拿新签名链接再直连（仅一次，防递归）
+  // 尝试2：重新解析拿新签名链接再直连。
+  // 注意 skipIntercept=true：失败原因多数是 CDN 签名过期/校验失败，
+  // 而拦截缓存里存的往往就是那个已经过期的旧链接，跳过它才能拿到新签名。
   let newUrl = '';
-  if (!video._retried && video.originalUrl) {
+  let altUrl = '';
+  if (video.originalUrl) {
     try {
-      const re = await parseVideo(video.originalUrl);
+      const re = await parseVideo(video.originalUrl, { skipIntercept: true });
       if (re && re.success) {
-        newUrl = (re.hdVideoUrl || re.videoUrl || '').trim();
+        newUrl = (re.hdVideoUrl || '').trim();
+        if (re.videoUrl && re.videoUrl !== re.hdVideoUrl) altUrl = (re.videoUrl || '').trim();
         if (newUrl && newUrl !== url) {
           console.log('[下载] 直连被拒，重新解析成功，换新链接重试');
           const r2 = await runDownload(newUrl);
@@ -1736,27 +1756,39 @@ async function downloadSingleVideo(video, language = '') {
     } catch (e) {}
   }
 
-  // 尝试3：自建代理兜底（服务器带 Cookie+Referer 拉流，直连/换链均被拒时成功率高）
-  if (!video._proxyTried) {
-    // 优先用重新解析后的新签名链接（旧链接可能已过期，代理也拉不到）
-    const proxyTarget = (newUrl && newUrl !== url) ? newUrl : url;
-    const proxyUrl = OWN_PROXY_API + encodeURIComponent(proxyTarget);
-    console.log('[下载] 直连失败，改走自建代理');
+  // 尝试3：自建代理兜底（服务器带 Cookie+Referer 拉流，能绕过直连被 CDN 拒绝的问题）。
+  // 依次尝试：重新解析的新签名链接 → 原高清链接 → 备用地址（若解析源同时给了多个地址）。
+  // 原画质（无水印）链接更容易失败，本质是签名有效期短 + 校验 Referer/Cookie/UA；
+  // 最后一步宁可换候选地址，也要把视频下下来。
+  const proxyCandidates = [];
+  const pushCandidate = (u) => {
+    u = (u || '').trim();
+    if (u && !proxyCandidates.includes(u)) proxyCandidates.push(u);
+  };
+  pushCandidate(newUrl && newUrl !== url ? newUrl : url);
+  pushCandidate(url); // 若与新签名不同才追加
+  pushCandidate(altUrl);
+  pushCandidate(video.videoUrl); // 解析源可能给了普通/带水印地址，作为最后兜底
+
+  let lastFail = result;
+  for (let ci = 0; ci < Math.min(proxyCandidates.length, 3); ci++) {
+    const cand = proxyCandidates[ci];
+    const proxyUrl = OWN_PROXY_API + encodeURIComponent(cand);
+    console.log(`[下载] 代理尝试 ${ci + 1}/${proxyCandidates.length}: ${cand.slice(0, 90)}`);
     let r3 = await runDownload(proxyUrl);
-    // Akamai 对数据中心 IP 间歇风控：代理失败后重试一次
+    // Akamai 等对数据中心 IP 间歇风控：短暂等待后重试一次
     if (!r3.success) {
       await new Promise(r => setTimeout(r, 1200));
-      console.log('[下载] 代理首次失败，重试');
       r3 = await runDownload(proxyUrl);
     }
+    lastFail = r3;
     if (r3.success) {
       await recordDownloadedVideo(video.id);
       return { ...r3, url: proxyUrl, viaProxy: true };
     }
-    return { ...r3, url };
   }
 
-  return { ...result, url };
+  return { ...lastFail, url: lastFail.url || url };
 }
 
 // ---------- 下载历史记录（串行队列，防止并发覆盖） ----------
