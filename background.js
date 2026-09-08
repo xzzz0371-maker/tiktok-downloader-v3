@@ -1350,7 +1350,8 @@ async function pumpUntilIdle() {
   let lastPullAt = Date.now();
   async function worker() {
     while (!stopParseRequested) {
-      const item = parsePending.shift();
+      // 用 pop() 取队尾：长队列下 shift() 是 O(n)，几千条会拖慢整体
+      const item = parsePending.pop();
       if (!item) {
         if (Date.now() - lastPullAt > POOL_IDLE_MS) return; // 空转超时，本批结束
         await sleep(60);
@@ -1392,8 +1393,11 @@ async function pumpUntilIdle() {
     }
   }
 
+  // 动态并发：小队列/自动流保持 3 个防轰炸；一次性大批量(>6 条)自动放宽到 8 个，
+  // 避免几千条的大列表被 3 个 worker 慢慢磨（旧代码大批量内部是 8 并发）
+  const poolSize = parsePending.length > 6 ? 8 : PARSE_POOL;
   const workers = [];
-  for (let w = 0; w < PARSE_POOL; w++) workers.push(worker());
+  for (let w = 0; w < poolSize; w++) workers.push(worker());
   await Promise.all(workers);
 
   // 合并到缓存（历史缓存 id 统一为字符串，新结果放最前）
