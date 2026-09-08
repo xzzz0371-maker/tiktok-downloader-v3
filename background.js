@@ -1313,6 +1313,22 @@ function ensurePool() {
   })();
 }
 
+// 解析成功“即时入列表”：每解出一个就写一次缓存（串行队列防并发写丢失），
+// 这样弹窗/侧边栏在解析过程中就能看到已完成的那几条，而不是等整批结束一次性出现。
+let _cacheSaveQueue = Promise.resolve();
+function persistParsedToCache(video) {
+  _cacheSaveQueue = _cacheSaveQueue.then(async () => {
+    try {
+      let all = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
+      const id = String(video.id);
+      if (!all.some(v => v.id === id)) all.unshift({ ...video, id });
+      if (all.length > 200) all = all.slice(0, 200);
+      await saveCachedVideos(all);
+    } catch (e) { console.warn('[缓存] 增量写入失败:', e.message); }
+  });
+  return _cacheSaveQueue;
+}
+
 // 跑一批：3 个 worker 同时从 parsePending 领 URL，直到队列空 + 空闲一段时间才算本批结束
 async function pumpUntilIdle() {
   const task = {
@@ -1327,7 +1343,14 @@ async function pumpUntilIdle() {
   let completed = 0;
   // 统一字符串 id：历史缓存里可能存在 number/string 混存或超过 2^53 丢失精度的 id
   const existing = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
-  const persist = () => writeParseProgress(task);
+  // 每次写进度前先回填计数，否则 popup 看到的 completed 会一直是 0
+  const persist = () => {
+    task.completed = completed;
+    task.success = results.length;
+    task.failed = failedUrls.length;
+    task.skipped = skippedCount;
+    return writeParseProgress(task);
+  };
 
   // 带重试的解析函数
   async function parseWithRetry(url, maxRetries = 1) {
@@ -1382,6 +1405,8 @@ async function pumpUntilIdle() {
             result.id = vid;
             if (!result.originalUrl) result.originalUrl = url;
             results.push(result);
+            // 即时写入缓存：列表实时显示已解析完成的那几条
+            await persistParsedToCache(result);
           }
         } else {
           failedUrls.push(url);
@@ -1400,13 +1425,8 @@ async function pumpUntilIdle() {
   for (let w = 0; w < poolSize; w++) workers.push(worker());
   await Promise.all(workers);
 
-  // 合并到缓存（历史缓存 id 统一为字符串，新结果放最前）
-  let allVideos = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
-  for (let i = results.length - 1; i >= 0; i--) allVideos.unshift(results[i]);
-  if (allVideos.length > 200) allVideos = allVideos.slice(0, 200);
-  try { await saveCachedVideos(allVideos); } catch (e) {}
-
-  // 异步获取文件大小（用 id 查找，避免 index 错位）
+  // 结果已逐条即时写入缓存（见 worker 内 persistParsedToCache），
+  // 这里不再整批合并，只补发文件大小异步回填
   results.forEach((v) => fetchVideoSizeInBackground(v));
 
   task.status = 'done';
