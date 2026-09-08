@@ -26,7 +26,9 @@ function formatDate(ts) {
 }
 
 const API_TIMEOUT = 10000;
-const DOWNLOAD_TIMEOUT = 120000; // 下载超时延长到 120 秒
+// 下载候选“首次无进展”判定：30 秒内没有任何字节进展才取消该候选，随后继续下一候选/重试。
+// 只要下载一直在走字节，观察会不断顺延（见 runDownload 的 checkTimeout），不会误杀大文件。
+const FIRST_STALL_CHECK_MS = 30000;
 // 自建解析后端（Cloudflare Pages 同域部署，国内可达；海外边缘多源轮询 + 页面直抓）
 const OWN_PARSE_API = 'https://tiktok-downloader-av8.pages.dev/api/parse';
 const OWN_PARSE_TOKEN = 'tdp2026x7kq9mz3vn8clw4r';
@@ -1680,7 +1682,7 @@ async function downloadSingleVideo(video, language = '') {
       };
       chrome.downloads.onChanged.addListener(listener);
       // 兜底：下载可能在监听挂上之前就已结束（文件极小或立即失败），主动查一次当前状态，
-      // 否则这类下载会一直等到 DOWNLOAD_TIMEOUT 被误判为“下载超时”。
+      // 否则这类下载会一直等到超时判定被误判为“下载超时”。
       chrome.downloads.search({ id: downloadId }, (items) => {
         if (settled) return;
         const it = items && items[0];
@@ -1722,63 +1724,65 @@ async function downloadSingleVideo(video, language = '') {
         setTimeout(() => removeDownloadProgress(downloadId), 8000);
         resolve({ success: false, error: '下载超时（无进展）' });
       };
-      setTimeout(checkTimeout, DOWNLOAD_TIMEOUT);
+      setTimeout(checkTimeout, FIRST_STALL_CHECK_MS);
     });
   }
 
-  // 尝试1：直连 CDN（用户住宅 IP 多数可直接下载）
-  let result = await runDownload(url);
-  if (result.success) {
-    await recordDownloadedVideo(video.id);
-    return { ...result, url };
-  }
+  // ============ 下载尝试（先拿新签名，再逐个候选） ============
+  // 失败高发原因：列表里保存的 hdVideoUrl 是“解析当时”的签名链接，稍后就过期。
+  // 原画质/无水印签名链接有效期短且校验 Referer/Cookie，过期链接直连还可能返回
+  // “200 + 错误页”被当成下载成功（文件却是坏的），导致要反复点好几次才能下到好的。
+  // 因此：原画质来源先做一次快速重解析拿到“新签名链接”，再按 新签名→旧地址 的顺序尝试，
+  // 最后走代理兜底；保证一次点击内就把链路走完，不再拿过期链接空试。
 
-  // 尝试2：重新解析拿新签名链接再直连。
-  // 注意 skipIntercept=true：失败原因多数是 CDN 签名过期/校验失败，
-  // 而拦截缓存里存的往往就是那个已经过期的旧链接，跳过它才能拿到新签名。
-  let newUrl = '';
-  let altUrl = '';
-  if (video.originalUrl) {
+  // 1) 先取新签名（仅对“原画质/页内拦截/自建后端/页面解析”等易过期来源执行，避免普通高清多等一轮）
+  const isFreshNeeded = /原画质/.test(String(video.quality || ''))
+    || /intercept|universal|sigi|own_backend|fetch_|_page|page/i.test(String(video._parseSource || ''));
+  let freshUrl = '';
+  let freshAltUrl = '';
+  if (isFreshNeeded && video.originalUrl) {
     try {
       const re = await parseVideo(video.originalUrl, { skipIntercept: true });
       if (re && re.success) {
-        newUrl = (re.hdVideoUrl || '').trim();
-        if (re.videoUrl && re.videoUrl !== re.hdVideoUrl) altUrl = (re.videoUrl || '').trim();
-        if (newUrl && newUrl !== url) {
-          console.log('[下载] 直连被拒，重新解析成功，换新链接重试');
-          const r2 = await runDownload(newUrl);
-          if (r2.success) {
-            await recordDownloadedVideo(video.id);
-            return { ...r2, url: newUrl };
-          }
-        }
+        freshUrl = (re.hdVideoUrl || '').trim();
+        if (re.videoUrl && re.videoUrl !== re.hdVideoUrl) freshAltUrl = (re.videoUrl || '').trim();
+        if (freshUrl) console.log('[下载] 已取得新签名链接');
       }
-    } catch (e) {}
+    } catch (e) {
+      console.log('[下载] 获取新签名失败（继续用缓存地址尝试）:', e.message);
+    }
   }
 
-  // 尝试3：自建代理兜底（服务器带 Cookie+Referer 拉流，能绕过直连被 CDN 拒绝的问题）。
-  // 依次尝试：重新解析的新签名链接 → 原高清链接 → 备用地址（若解析源同时给了多个地址）。
-  // 原画质（无水印）链接更容易失败，本质是签名有效期短 + 校验 Referer/Cookie/UA；
-  // 最后一步宁可换候选地址，也要把视频下下来。
-  const proxyCandidates = [];
-  const pushCandidate = (u) => {
+  // 2) 候选地址去重排序：新签名 → 缓存高清 → 备用地址 → 解析源普通地址
+  const candidates = [];
+  const pushCand = (u) => {
     u = (u || '').trim();
-    if (u && !proxyCandidates.includes(u)) proxyCandidates.push(u);
+    if (u && !candidates.includes(u)) candidates.push(u);
   };
-  pushCandidate(newUrl && newUrl !== url ? newUrl : url);
-  pushCandidate(url); // 若与新签名不同才追加
-  pushCandidate(altUrl);
-  pushCandidate(video.videoUrl); // 解析源可能给了普通/带水印地址，作为最后兜底
+  pushCand(freshUrl);
+  pushCand(url);
+  pushCand(freshAltUrl);
+  pushCand(video.videoUrl);
+  if (candidates.length === 0) return { success: false, error: '无视频链接', url: null };
 
-  let lastFail = result;
-  for (let ci = 0; ci < Math.min(proxyCandidates.length, 3); ci++) {
-    const cand = proxyCandidates[ci];
+  // 3) 直连逐个尝试（住宅 IP 多数可直接下载；失败会快速返回，不会卡死）
+  for (const cand of candidates) {
+    const r = await runDownload(cand);
+    if (r.success) {
+      await recordDownloadedVideo(video.id);
+      return { ...r, url: cand };
+    }
+  }
+
+  // 4) 全部直连失败 → 自建代理逐个尝试（服务器带 Cookie+Referer，绕开直连被拒问题）。
+  //    每个候选失败后短暂等待重试一次（应对 CDN 对数据中心 IP 的间歇风控）。
+  let lastFail = null;
+  for (const cand of candidates) {
     const proxyUrl = OWN_PROXY_API + encodeURIComponent(cand);
-    console.log(`[下载] 代理尝试 ${ci + 1}/${proxyCandidates.length}: ${cand.slice(0, 90)}`);
+    console.log(`[下载] 代理尝试: ${cand.slice(0, 90)}`);
     let r3 = await runDownload(proxyUrl);
-    // Akamai 等对数据中心 IP 间歇风控：短暂等待后重试一次
     if (!r3.success) {
-      await new Promise(r => setTimeout(r, 1200));
+      await sleep(1200);
       r3 = await runDownload(proxyUrl);
     }
     lastFail = r3;
@@ -1788,7 +1792,7 @@ async function downloadSingleVideo(video, language = '') {
     }
   }
 
-  return { ...lastFail, url: lastFail.url || url };
+  return { ...(lastFail || { success: false, error: '下载失败' }), url };
 }
 
 // ---------- 下载历史记录（串行队列，防止并发覆盖） ----------
