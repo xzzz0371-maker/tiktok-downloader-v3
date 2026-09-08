@@ -81,7 +81,7 @@ console.log('=== 3. 功能链路（插件） ===');
     ['recommend-auto-parse 监听', bg.includes("type === 'recommend-auto-parse'")],
     ['download-single 监听', bg.includes("type === 'download-single'")],
     ['download-all-background 监听', bg.includes("type === 'download-all-background'")],
-    ['两段式解析窗口（5s原画质/3s API）', bg.includes('PARSE_ORIG_MS') && bg.includes('PARSE_API_MS')],
+    ['两段式解析（2s高清无水印 / 4s原画质）', bg.includes('PARSE_FAST_HD_MS') && bg.includes('PARSE_ORIG_MS')],
     ['3 并发解析池', bg.includes('PARSE_POOL') && bg.includes('pumpUntilIdle')],
   ];
   for (const [name, v] of checks) v ? ok('background: ' + name) : bad('background: ' + name);

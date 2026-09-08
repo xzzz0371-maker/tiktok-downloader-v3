@@ -26,10 +26,11 @@ function formatDate(ts) {
 }
 
 const API_TIMEOUT = 10000;
-// 解析两段式窗口（速度优先版）：
-// 第一段“无水印/原画质通道”最多等 3 秒；第二段“第三方无水印源并行”最多 2 秒
-const PARSE_ORIG_MS = 3000;
-const PARSE_API_MS = 2000;
+// 解析两段式窗口（速度优先 + 高清无水印优先）：
+// 第一段先跑“高清无水印快源”(第三方 API + 自建 api 池)最多 2 秒；
+// 拿不到再跑“原画质/无水印慢通道”(页面/官方 item/本地拦截)最多 4 秒
+const PARSE_FAST_HD_MS = 2000;
+const PARSE_ORIG_MS = 4000;
 // 下载候选“首次无进展”判定：30 秒内没有任何字节进展才取消该候选，随后继续下一候选/重试。
 // 只要下载一直在走字节，观察会不断顺延（见 runDownload 的 checkTimeout），不会误杀大文件。
 const FIRST_STALL_CHECK_MS = 30000;
@@ -1184,15 +1185,34 @@ async function parseVideo(url, opts = {}) {
     return r;
   };
 
-  // ===== 第一段（最多 3 秒）：只跑“无水印/原画质”通道 =====
+  // ===== 第一段（最多 2 秒）：“高清无水印”快源优先 =====
+  // 第三方 API(hdplay/no_watermark) + 自建后端 api 池，通常 <1s 返回，谁快用谁
+  const fastHdSources = [];
+  fastHdSources.push(parseViaOwnBackendMode(finalUrl, 'api').then(finalize).catch(e => { throw e; }));
+  for (const api of availableApis) {
+    fastHdSources.push(fetchAndParse(api).then(r => {
+      r._parseSource = 'third_party';
+      return finalize(r);
+    }).catch(e => { throw e; }));
+  }
+  try {
+    const rFast = await Promise.race([
+      Promise.any(fastHdSources),
+      timeoutOf(PARSE_FAST_HD_MS, '高清无水印快源超时')
+    ]);
+    if (rFast?.success) return rFast;
+  } catch (e) {
+    console.log('[解析] 第一段高清无水印未命中（' + PARSE_FAST_HD_MS + 'ms），切原画质通道:', e.message);
+  }
+
+  // ===== 第二段（最多 4 秒）：“原画质/无水印”慢通道兜底 =====
   // 本地拦截 / 页面深度解析 / FetchHTML / 自建后端 html（抖音直抓）/ TikTok 官方 item。
-  // 任何一个先返回就立即收工 —— 命中时大多 1~2 秒出结果。
   const origSources = [];
   origSources.push(parseViaOwnBackendMode(finalUrl, 'html').then(finalize).catch(e => { throw e; }));
   if (/\/video\/\d+|\/v\/\d+/.test(finalUrl)) {
     origSources.push(parseViaOwnBackendMode(finalUrl, 'item').then(finalize).catch(e => { throw e; }));
   }
-  // 下载重试时跳过本地拦截（拦截缓存里常存已过期的旧签名）
+  // 下载重试不再走本函数；本地拦截保留用于常规解析（拦截缓存里通常是最新的无水印地址）
   if (!opts.skipIntercept) {
     origSources.push(parseViaIntercept(finalUrl).then(finalize).catch(e => { throw e; }));
   }
@@ -1200,32 +1220,13 @@ async function parseVideo(url, opts = {}) {
   origSources.push(parseViaFetchHtml(finalUrl).then(finalize).catch(e => { throw e; }));
 
   try {
-    const r1 = await Promise.race([
+    const rOrig = await Promise.race([
       Promise.any(origSources),
-      timeoutOf(PARSE_ORIG_MS, '无水印通道超时')
+      timeoutOf(PARSE_ORIG_MS, '原画质通道超时')
     ]);
-    if (r1?.success) return r1;
+    if (rOrig?.success) return rOrig;
   } catch (e) {
-    console.log('[解析] 第一段无水印通道未命中（' + PARSE_ORIG_MS + 'ms），切第三方并行:', e.message);
-  }
-
-  // ===== 第二段（2 秒）：第三方无水印源并行，谁快用谁（带水印结果会被 finalize 丢弃）=====
-  const apiSources = [];
-  apiSources.push(parseViaOwnBackendMode(finalUrl, 'api').then(finalize).catch(e => { throw e; }));
-  for (const api of availableApis) {
-    apiSources.push(fetchAndParse(api).then(r => {
-      r._parseSource = 'third_party';
-      return finalize(r);
-    }).catch(e => { throw e; }));
-  }
-  try {
-    const r2 = await Promise.race([
-      Promise.any(apiSources),
-      timeoutOf(PARSE_API_MS, '第三方无水印源超时')
-    ]);
-    if (r2?.success) return r2;
-  } catch (e) {
-    console.log('[解析] 第二段也无水印结果:', e.message);
+    console.log('[解析] 原画质兜底也未命中:', e.message);
   }
 
   return { success: false, originalUrl: finalUrl, error: '未能获取到无水印资源' };
