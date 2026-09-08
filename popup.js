@@ -602,7 +602,6 @@ async function handleParse(allowDuplicate = false) {
       } else {
         showToast(`🚀 已开始解析 ${response.total} 个视频，完成后会通知你`);
       }
-      urlInput.value = '';
       parseBtn.disabled = true;
       parseBtn.style.opacity = '0.5';
       parseBtn.style.cursor = 'wait';
@@ -914,7 +913,22 @@ document.addEventListener('DOMContentLoaded', async () => {
             break;
           }
         }
-      } catch (e) {}
+        // 诊断：一次都没命中时，在空态区显示检测到的标签页（截图即可定位问题）
+        if (!lastAutoParsedUrl) {
+          const urls = list.map(t=>t&&t.url).filter(Boolean);
+          console.log('[autoparse] no target. tabs=', urls);
+          try {
+            const sub = videoList.querySelector('.empty-sub');
+            if (sub && urls.length) {
+              sub.textContent = '检测到: ' + urls[0].slice(0, 70);
+              sub.style.color = '#ff6b6b';
+            } else if (sub) {
+              sub.textContent = '未检测到标签页（tabs 查询为空）';
+              sub.style.color = '#ff6b6b';
+            }
+          } catch (e) {}
+        }
+      } catch (e) { console.log('[autoparse] error:', e && e.message); }
     }
 
     // 切换标签页时触发（无延迟）
@@ -971,11 +985,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     sidePanelBtn.style.display = 'none'; // 已经在侧边栏里了
 
     // 侧边栏：当前窗口的活动标签页
-    setupAutoParse({ active: true, currentWindow: true });
+    setupAutoParse({ active: true });
   }
 
   // ===== 弹窗（默认）模式：同样支持自动解析 =====
   if (!isWindowMode && !isSidePanel) {
-    setupAutoParse({ active: true, currentWindow: true });
+    setupAutoParse({ active: true });
   }
 });
