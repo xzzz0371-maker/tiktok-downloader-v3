@@ -140,6 +140,95 @@ function resolveAddr(vd) {
   return cands.find(u => u.startsWith('http')) || '';
 }
 
+// ============================================================
+//  抖音页面直抓（v.douyin.com / douyin.com/video|note 展开后的 HTML）
+//  抖音在 window._ROUTER_DATA / self.__pace_f.push(...) 里塞了条目 JSON，
+//  结构形如 loaderData[xxx].videoInfoRes.item_list[0]（video.play_addr.url_list）
+// ============================================================
+
+// 从给定起始 '{' 处截取配对的 JSON（感知字符串与转义），避免盲目 JSON.parse 大段 HTML
+function sliceBalancedJson(text, start) {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+  return null;
+}
+
+// 递归找出形如 { video: { play_addr: { url_list: [...] } } } 的抖音条目
+function collectAwemeCandidates(node, out, depth) {
+  if (!node || typeof node !== 'object' || depth > 6) return;
+  if (Array.isArray(node)) {
+    for (const x of node) collectAwemeCandidates(x, out, depth + 1);
+    return;
+  }
+  if (node.video && node.video.play_addr && Array.isArray(node.video.play_addr.url_list)) {
+    out.push(node);
+    return; // 找到一个条目就不再深入
+  }
+  const keys = Object.keys(node);
+  if (keys.length > 60) return; // 大对象不再深挖，防递归爆炸
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(node, k)) collectAwemeCandidates(node[k], out, depth + 1);
+  }
+}
+
+function extractDouyinVideo(html) {
+  const scripts = String(html).match(/<script[^>]*>([\s\S]*?)<\/script>/g) || [];
+  const markers = [/window\._ROUTER_DATA\s*=\s*/, /self\.__pace_f\.push\(\s*/, /window\.__pace_f\.push\(\s*/];
+  const found = [];
+  for (const sc of scripts) {
+    if (sc.length > 5 * 1024 * 1024) continue; // 防超大脚本
+    const body = sc.replace(/^<script[^>]*>/, '').replace(/<\/script>$/, '');
+    for (const marker of markers) {
+      const m = marker.exec(body);
+      if (!m) continue;
+      const braceIdx = body.indexOf('{', m.index);
+      if (braceIdx < 0) continue;
+      const json = sliceBalancedJson(body, braceIdx);
+      if (!json || json.length < 200 || json.length > 4 * 1024 * 1024) continue;
+      try {
+        collectAwemeCandidates(JSON.parse(json), found, 0);
+      } catch (e) { /* 下一个 marker */ }
+      if (found.length) break;
+    }
+    if (found.length) break;
+  }
+  if (!found.length) return null;
+  const a = found[0];
+  const vd = a.video || {};
+  const pa = vd.play_addr || {};
+  const urlList = Array.isArray(pa.url_list) ? pa.url_list : [];
+  const addr = urlList.find(u => typeof u === 'string' && u.startsWith('http')) || '';
+  const images = Array.isArray(a.images)
+    ? a.images.map(i => {
+        const urls = (i && (i.url_list || (i.imageURL && i.imageURL.url_list))) || [];
+        return urls.find(u => typeof u === 'string' && u.startsWith('http')) || '';
+      }).filter(Boolean)
+    : [];
+  if (!addr && !images.length) return null;
+  const cover = (vd.cover && vd.cover.url_list && vd.cover.url_list[0]) || '';
+  return {
+    addr, images,
+    title: a.desc || '',
+    author: (a.author && (a.author.nickname || a.author.unique_id)) || '',
+    cover,
+    duration: vd.duration || 0,
+    likes: (a.statistics && a.statistics.digg_count) || 0,
+    createTime: a.create_time || 0
+  };
+}
+
+
 async function parseFromPage(finalUrl, diag) {
   let lastErr = null;
   for (const ua of [UA, MOBILE_UA, GOOGLEBOT_UA]) {
@@ -248,6 +337,21 @@ async function parseHtmlWithUA(finalUrl, userAgent, diag) {
     } catch (e) {}
   }
 
+  // 3.5 抖音专用直抓（_ROUTER_DATA / __pace_f；TikTok 页面没有这些结构，不影响）
+  if (!videoUrl && !images.length) {
+    const dy = extractDouyinVideo(html);
+    if (dy) {
+      if (dy.addr) { videoUrl = dy.addr; hdVideoUrl = dy.addr; }
+      if (dy.images && dy.images.length) images = dy.images;
+      if (!title) title = dy.title;
+      if (!author) author = dy.author;
+      if (!cover) cover = dy.cover;
+      if (!_dur) _dur = dy.duration || 0;
+      if (!_likes) _likes = dy.likes || 0;
+      if (!_ct) _ct = dy.createTime || 0;
+    }
+  }
+
   // 4. 正则兜底 mp4/m3u8
   if (!videoUrl) {
     const ms = html.match(/https?:\/\/[^\s"']+\.(mp4|m3u8)[^\s"']*/g) || [];
@@ -298,15 +402,16 @@ async function getTikTokCookie() {
   return cookieCache.value;
 }
 
-// TikTok 官方内部 API：item/detail（带 cookie，多区域轮询，缓解 region-lock 视频 playAddr 为空）
-async function parseViaItemDetail(itemId) {
+// TikTok 官方内部 API 通用查询：item/detail 与 item/get（带 cookie，多区域轮询，
+// 缓解 region-lock 视频 playAddr 为空；两个接口互为冗余，提高命中率）
+async function parseTiktokOfficial(itemId, apiPath, sourceName) {
   const ck = await getTikTokCookie();
   const REGIONS = ['US', 'SG', 'ID', 'MY', 'HK', 'TW', 'JP'];
   let lastErr = null;
   for (const region of REGIONS) {
     try {
       const resp = await fetchWithTimeout(
-        'https://www.tiktok.com/api/item/detail/?itemId=' + itemId + '&aid=1988&app_language=en&device_platform=web_pc&os=windows&region=' + region,
+        'https://www.tiktok.com' + apiPath + '?itemId=' + itemId + '&aid=1988&app_language=en&device_platform=web_pc&os=windows&region=' + region,
         {
           headers: {
             'User-Agent': UA,
@@ -315,9 +420,9 @@ async function parseViaItemDetail(itemId) {
             'Accept': 'application/json, text/plain, */*'
           }
         }, API_TIMEOUT);
-      if (!resp.ok) { lastErr = new Error('item-detail HTTP ' + resp.status); continue; }
+      if (!resp.ok) { lastErr = new Error(sourceName + ' HTTP ' + resp.status); continue; }
       const txt = await resp.text();
-      if (!txt || txt.length < 10) { lastErr = new Error('item-detail empty'); continue; }
+      if (!txt || txt.length < 10) { lastErr = new Error(sourceName + ' empty'); continue; }
       const d = JSON.parse(txt);
       const v = d?.itemInfo?.itemStruct || d?.data?.itemInfo?.itemStruct;
       if (v?.id) {
@@ -340,17 +445,19 @@ async function parseViaItemDetail(itemId) {
             videoUrl: addr, hdVideoUrl: addr,
             images, duration: vd.duration || 0,
             likes: (v.stats && (v.stats.diggCount || v.stats.digg_count)) || 0,
-            createTime: v.createTime || 0, source: 'tiktok-item-detail'
+            createTime: v.createTime || 0, source: sourceName
           };
         }
-        lastErr = new Error('item-detail no addr (region=' + region + ')');
+        lastErr = new Error(sourceName + ' no addr (region=' + region + ')');
       } else {
-        lastErr = new Error('item-detail no struct');
+        lastErr = new Error(sourceName + ' no struct');
       }
     } catch (e) { lastErr = e; }
   }
-  throw lastErr || new Error('item-detail no data');
+  throw lastErr || new Error(sourceName + ' no data');
 }
+async function parseViaItemDetail(itemId) { return parseTiktokOfficial(itemId, '/api/item/detail/', 'tiktok-item-detail'); }
+async function parseViaItemGet(itemId) { return parseTiktokOfficial(itemId, '/api/item/get/', 'tiktok-item-get'); }
 
 // 第三方解析源（Worker 海外访问，不受国内网络限制）
 function buildApiSources(enc, itemId) {
@@ -478,40 +585,60 @@ function buildApiSources(enc, itemId) {
   ];
 }
 
-// 并行竞速 + 降级：页面直抓 + 全部第三方源
-async function parseViaSources(finalUrl, diag) {
+// 并行竞速 + 降级：页面直抓 + TikTok 官方接口 + 全部第三方源。
+// mode：all=全部策略；html=只跑页面直抓；api=只跑第三方源；item=只跑 TikTok 官方接口
+async function parseViaSources(finalUrl, diag, mode) {
+  mode = mode || 'all';
   const errors = [];
   const enc = encodeURIComponent(finalUrl);
   const itemId = extractVideoId(finalUrl) || '';
   const apis = buildApiSources(enc, itemId).filter(s => !sourceInCooldown(s.name));
-  const sources = [parseFromPage(finalUrl, diag).then(r => { recordSource('page', true); return r; }).catch(e => {
-    recordSource('page', false);
-    if (diag) errors.push('page: ' + e.message);
-    throw e;
-  })];
-  if (itemId) {
-    sources.push(parseViaItemDetail(itemId).then(r => { recordSource('tiktok-item-detail', true); return r; }).catch(e => {
-      recordSource('tiktok-item-detail', false);
-      if (diag) errors.push('tiktok-item-detail: ' + e.message);
+  const runPage = mode === 'all' || mode === 'html';
+  const runApis = mode === 'all' || mode === 'api';
+  const runItem = mode === 'all' || mode === 'item';
+  const sources = [];
+
+  if (runPage) {
+    sources.push(parseFromPage(finalUrl, diag).then(r => { recordSource('page', true); return r; }).catch(e => {
+      recordSource('page', false);
+      if (diag) errors.push('page: ' + e.message);
       throw e;
     }));
   }
-  for (const s of apis) {
-    sources.push((async () => {
-      try {
-        const resp = await fetchWithTimeout(s.url, { headers: { 'User-Agent': UA } }, API_TIMEOUT);
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const data = await resp.json();
-        const r = s.parse(data);
-        if (!r || !r.success) throw new Error('parse fail');
-        recordSource(s.name, true);
-        return r;
-      } catch (e) {
-        recordSource(s.name, false);
-        if (diag) errors.push(s.name + ': ' + e.message);
+  if (runItem && itemId) {
+    for (const [name, fn] of [['tiktok-item-detail', () => parseViaItemDetail(itemId)],
+                              ['tiktok-item-get', () => parseViaItemGet(itemId)]]) {
+      sources.push(fn().then(r => { recordSource(name, true); return r; }).catch(e => {
+        recordSource(name, false);
+        if (diag) errors.push(name + ': ' + e.message);
         throw e;
-      }
-    })());
+      }));
+    }
+  }
+  if (runApis) {
+    for (const s of apis) {
+      sources.push((async () => {
+        try {
+          const resp = await fetchWithTimeout(s.url, { headers: { 'User-Agent': UA } }, API_TIMEOUT);
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const data = await resp.json();
+          const r = s.parse(data);
+          if (!r || !r.success) throw new Error('parse fail');
+          recordSource(s.name, true);
+          return r;
+        } catch (e) {
+          recordSource(s.name, false);
+          if (diag) errors.push(s.name + ': ' + e.message);
+          throw e;
+        }
+      })());
+    }
+  }
+
+  if (!sources.length) {
+    const err = new Error('no source for mode=' + mode);
+    err.diag = errors;
+    throw err;
   }
 
   try {
@@ -520,19 +647,21 @@ async function parseViaSources(finalUrl, diag) {
       new Promise((_, reject) => setTimeout(() => reject(new Error('total timeout')), TOTAL_PARSE_TIMEOUT))
     ]);
   } catch (e) {
-    // 全部失败：逐个降级（跳过冷却源）
-    for (const s of apis) {
-      if (sourceInCooldown(s.name)) continue;
-      try {
-        const resp = await fetchWithTimeout(s.url, { headers: { 'User-Agent': UA } }, 6000);
-        if (!resp.ok) { if (diag) errors.push(s.name + ' [fallback]: HTTP ' + resp.status); continue; }
-        const r = s.parse(await resp.json());
-        if (r?.success) { recordSource(s.name, true); return r; }
-        recordSource(s.name, false);
-        if (diag) errors.push(s.name + ' [fallback]: parse fail');
-      } catch (e2) {
-        recordSource(s.name, false);
-        if (diag) errors.push(s.name + ' [fallback]: ' + e2.message);
+    // 全部失败：逐个降级（跳过冷却源）——仅 api 模式/全量模式下有第三方源可降级
+    if (runApis) {
+      for (const s of apis) {
+        if (sourceInCooldown(s.name)) continue;
+        try {
+          const resp = await fetchWithTimeout(s.url, { headers: { 'User-Agent': UA } }, 6000);
+          if (!resp.ok) { if (diag) errors.push(s.name + ' [fallback]: HTTP ' + resp.status); continue; }
+          const r = s.parse(await resp.json());
+          if (r?.success) { recordSource(s.name, true); return r; }
+          recordSource(s.name, false);
+          if (diag) errors.push(s.name + ' [fallback]: parse fail');
+        } catch (e2) {
+          recordSource(s.name, false);
+          if (diag) errors.push(s.name + ' [fallback]: ' + e2.message);
+        }
       }
     }
     const err = new Error('all sources failed');
@@ -570,7 +699,8 @@ async function handleParse(request) {
 
   try {
     const diag = url.searchParams.get('diag') === '1';
-    const result = await parseViaSources(target, diag);
+    const mode = url.searchParams.get('mode') || 'all';
+    const result = await parseViaSources(target, diag, mode);
     return jsonResponse(result, 200, corsHeaders());
   } catch (e) {
     const body = { success: false, error: e.message || 'parse failed' };

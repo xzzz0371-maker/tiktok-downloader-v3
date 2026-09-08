@@ -775,6 +775,33 @@ async function enrichVideoAsync(video) {
 // ============================================================
 //  模块四：第三方 API（兜底）
 // ============================================================
+
+// 通用解析：douyin.wtf / qingdou 等 “hybrid/video_data” 风格抖音接口（code 200 + data.video_data）
+function parseHybridDouyin(data) {
+  if (!data || data.code !== 200 || !data.data) return null;
+  const vd = data.data.video_data || data.data;
+  const author = data.data.author || vd.author || {};
+  const play = String(vd.play || vd.play_addr || vd.video_url || '').trim();
+  const images = Array.isArray(vd.images)
+    ? vd.images.map(x => {
+        if (typeof x === 'string') return x;
+        if (x && x.url_list && Array.isArray(x.url_list)) return x.url_list[0] || '';
+        return (x && x.url) || '';
+      }).filter(Boolean)
+    : [];
+  if (!play && !images.length) return null;
+  return {
+    success: true, type: (images.length && !play) ? 'photo' : 'video',
+    id: vd.vid || vd.aweme_id || vd.id || Date.now(), title: vd.desc || vd.title || '无标题',
+    author: author.nickname || '未知作者', authorAvatar: author.avatar || '',
+    cover: vd.cover || '', videoUrl: play,
+    hdVideoUrl: String(vd.hdplay || vd.hd_play || vd.no_watermark || play).trim(),
+    images, duration: vd.duration || 0, quality: '高清',
+    likes: formatLikes(vd.statistics?.digg_count || vd.digg_count || vd.stats?.diggCount || 0),
+    createTime: formatDate(vd.create_time || vd.createTime || 0)
+  };
+}
+
 function getApiList(encoded) {
   return [
     {
@@ -813,21 +840,15 @@ function getApiList(encoded) {
     },
     {
       url: `https://api.douyin.wtf/api/hybrid/video_data?url=${encoded}&minimal=false`,
-      parse: (data) => {
-        if (data.code === 200 && data.data) {
-          const vd = data.data.video_data || data.data;
-          const author = data.data.author || {};
-          return {
-            success: true, id: vd.vid || vd.id || Date.now(), title: vd.desc || vd.title || '无标题',
-            author: author.nickname || '未知作者', authorAvatar: author.avatar || '',
-            cover: vd.cover || '', videoUrl: (vd.play || '').trim(),
-            hdVideoUrl: (vd.hdplay || vd.play || '').trim(), duration: vd.duration || 0, quality: '高清',
-            likes: formatLikes(vd.statistics?.digg_count || vd.digg_count || vd.stats?.diggCount || 0),
-            createTime: formatDate(vd.create_time || vd.createTime || 0)
-          };
-        }
-        return null;
-      }
+      parse: parseHybridDouyin
+    },
+    {
+      url: `https://www.douyin.wtf/api/hybrid/video_data?url=${encoded}&minimal=false`,
+      parse: parseHybridDouyin
+    },
+    {
+      url: `https://api.qingdou.vip/api/hybrid/video_data?url=${encoded}&minimal=false`,
+      parse: parseHybridDouyin
     },
     {
       url: `https://api-social-sooty.vercel.app/api/tiktok?url=${encoded}`,
@@ -986,46 +1007,11 @@ function getApiList(encoded) {
         return null;
       }
     },
-    // tiktokdl-api (Node.js/CoffeeScript) - 用户可自行部署
-    {
-      url: `https://tiktokdl-api.example.com/tiktok/api.php?url=${encoded}`,
-      parse: (data) => {
-        if (data?.video && Array.isArray(data.video) && data.video.length > 0) {
-          const playUrl = data.video[0];
-          if (playUrl) {
-            return {
-              success: true, id: Date.now(), title: 'TikTok Video',
-              author: '未知作者', authorAvatar: '', cover: '',
-              videoUrl: playUrl.trim(), hdVideoUrl: playUrl.trim(),
-              duration: 0, quality: '高清', likes: '', createTime: ''
-            };
-          }
-        }
-        return null;
-      }
-    },
     // ===== 用户自定义 API 区域 =====
     // 部署好自己的 API 后，取消下面的注释并修改 URL
     // {
     //   url: `https://your-domain.com/api/hybrid/video_data?url=${encoded}&minimal=false`,
-    //   parse: (data) => {
-    //     if (data.code === 200 && data.data) {
-    //       const vd = data.data.video_data || data.data;
-    //       const author = data.data.author || {};
-    //       return {
-    //         success: true, id: vd.vid || vd.id || Date.now(),
-    //         title: vd.desc || vd.title || '无标题',
-    //         author: author.nickname || '未知作者', authorAvatar: author.avatar || '',
-    //         cover: vd.cover || '',
-    //         videoUrl: (vd.play || '').trim(),
-    //         hdVideoUrl: (vd.hdplay || vd.play || '').trim(),
-    //         duration: vd.duration || 0, quality: '高清',
-    //         likes: formatLikes(vd.statistics?.digg_count || vd.digg_count || 0),
-    //         createTime: formatDate(vd.create_time || vd.createTime || 0)
-    //       };
-    //     }
-    //     return null;
-    //   }
+    //   parse: parseHybridDouyin
     // }
   ];
 }
@@ -1116,11 +1102,28 @@ async function parseViaIntercept(finalUrl) {
 }
 
 
+// 自建解析后端 = 一个“接口池”：同一个视频并行请求几种 mode（不同策略组），
+// html=页面直抓(含抖音 _ROUTER_DATA)、item=TikTok 官方接口、api=第三方源池。
+// 谁先成功用谁的，比单次请求更稳（单次里某策略被风控/失效不影响其它）。
 async function parseViaOwnBackend(finalUrl) {
-  const resp = await fetchWithTimeout(OWN_PARSE_API + '?url=' + encodeURIComponent(finalUrl) + '&token=' + OWN_PARSE_TOKEN, {}, 12000);
-  if (!resp.ok) throw new Error('backend HTTP ' + resp.status);
-  const d = await resp.json();
-  if (!d || !d.success) throw new Error((d && d.error) || 'backend parse failed');
+  const base = OWN_PARSE_API + '?url=' + encodeURIComponent(finalUrl) + '&token=' + OWN_PARSE_TOKEN;
+  const modes = ['html', 'api'];
+  // 只有带可识别 id 的视频页才有必要跑 TikTok 官方 item 接口
+  if (/\/video\/\d+|\/v\/\d+|\/note\/\d+/.test(finalUrl)) modes.push('item');
+  const requests = modes.map(m => fetchWithTimeout(base + '&mode=' + m, {}, 13000).then(async (resp) => {
+    if (!resp.ok) throw new Error('backend HTTP ' + resp.status);
+    const d = await resp.json();
+    if (!d || !d.success) throw new Error((d && d.error) || 'backend parse failed');
+    return d;
+  }));
+
+  let d;
+  try {
+    d = await Promise.any(requests);
+  } catch (e) {
+    // 全部 mode 失败：把第一个能读到的错误抛出去
+    throw new Error('backend parse failed');
+  }
   return {
     success: true,
     originalUrl: finalUrl,
