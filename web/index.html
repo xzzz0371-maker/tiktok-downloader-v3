@@ -466,12 +466,12 @@
       if(!d || !d.success) return null;
       if(!d.videoUrl && (!d.images || !d.images.length)) return null;
       return {
-        videoUrl: d.videoUrl || '',
+        videoUrl: (/^https?:\/\//i.test(d.videoUrl || '')) ? d.videoUrl : '',
         cover: d.cover || '',
         title: d.title || '',
         author: d.author || '',
         duration: d.duration || 0,
-        images: d.images || [],
+        images: (d.images || []).filter(function(x){ return /^https?:\/\//i.test(x); }),
         type: d.type || 'video',
         source: '自建后端'
       };
@@ -541,9 +541,13 @@
   }
 
   function pickUrl(raw){
-    var m = raw.match(/https?:\/\/[^\s"'<>]+/i) || raw.match(/(?:tiktok\.com|douyin\.com)\S*/i);
-    if(!m) return null;
-    var u = m[0].replace(/[),.;，。、]+$/,'');
+    // 优先整段 http(s) 链接；无协议时按“可选子域名 + tiktok/douyin 域名”整体匹配，
+    // 且要求前一个字符是空白/引号/括号等边界，避免从 xdouyin.com 之类中间截出错误域名。
+    var m1 = raw.match(/https?:\/\/[^\s"'<>]+/i);
+    var m2 = raw.match(/(?:^|[\s"'<>（(])((?:[\w-]+\.)*(?:tiktok|douyin|iesdouyin)\.com[^\s"'<>]*)/i);
+    var u = (m1 && m1[0]) || (m2 && m2[1]) || '';
+    if(!u) return null;
+    u = u.replace(/[),.;，。、]+$/,'');
     if(!/^https?:/i.test(u)) u = 'https://' + u;
     return u;
   }
@@ -625,14 +629,22 @@
 
   function hideStatus(){ status.className='status'; status.innerHTML=''; }
 
+  // 只在地址确为 http(s) 时才新窗口打开，防止第三方返回 javascript: 之类协议被当作 URL 执行
+  function safeOpenUrl(u){
+    if(!/^https?:\/\//i.test(u || '')) return false;
+    window.open(u, '_blank');
+    return true;
+  }
+
   function showResult(v){
+    var hasVideo = /^https?:\/\//i.test(v.videoUrl || '');
     vCover.hidden = !v.cover;
     if(v.cover) vCover.src = v.cover;
     vPlayer.pause();
     vPlayer.removeAttribute('src');
     vPlayer.load();
     vPlayer.hidden = true;
-    vPlayBtn.hidden = !v.cover;
+    vPlayBtn.hidden = !(v.cover && hasVideo);
     vWmark.hidden = false;
     vDur.hidden = !fmtDur(v.duration);
     if(fmtDur(v.duration)) vDur.textContent = fmtDur(v.duration);
@@ -647,9 +659,11 @@
       delete vDl.dataset.album;
       delete vDl.dataset.albumUrls;
     }
-    vDl.href = v.videoUrl || (v.images && v.images[0]) || '#';
+    vDl.href = hasVideo ? v.videoUrl : ((v.images && v.images[0]) || '#');
     vDl.setAttribute('download','');
-    vOpen.href = v.videoUrl;
+    // 纯图集没有“原视频”：隐藏并置空，避免 href='#'/'javascript:...' 导致点击跳到本页或执行
+    vOpen.href = hasVideo ? v.videoUrl : '#';
+    vOpen.hidden = !hasVideo;
     resBox.classList.add('show');
   }
 
@@ -671,8 +685,10 @@
     e.preventDefault();
     var src = vDl.getAttribute('href') || vDl.href;
     if(!src || src === '#') return;
+    if(vDl.classList.contains('busy')) return; // 下载进行中禁止重复点击，防止并发重复下载
     var orig = vDl.innerHTML;
     var attempt = 0;
+    var isAlbum = !!(vDl.dataset.album && vDl.dataset.albumUrls);
     var doDownload = function(targetUrls){
       vDl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9"/></svg>下载中…';
       vDl.classList.add('busy');
@@ -682,7 +698,9 @@
           .then(function(blob){
             var objUrl = URL.createObjectURL(blob);
             var a = document.createElement('a');
-            var m = (u.match(/\.(png|jpe?g|webp|mp4)/i)||[])[1] || 'mp4';
+            var mm = (u.match(/\.(png|jpe?g|webp|mp4)/i)||[])[1];
+            // 无扩展名的 CDN 链接：图集默认 jpg、视频默认 mp4，避免把图片存成 .mp4
+            var m = mm ? mm.toLowerCase() : (isAlbum ? 'jpg' : 'mp4');
             a.href = objUrl;
             a.download = 'tiktok-' + Date.now() + '-' + (i + 1) + '.' + m;
             document.body.appendChild(a);
@@ -703,24 +721,26 @@
             attempt++;
             resolve(lastInput).then(function(nv){
               if(nv){
-                vDl.href = nv.videoUrl || (nv.images && nv.images[0]) || '#';
-                var retryUrls = (nv.images && nv.images.length && !nv.videoUrl) ? nv.images : [nv.videoUrl || src];
+                // 重新解析得到的链接也要校验协议，防止第三方返回 javascript: 之类地址
+                var nvUrl = /^https?:\/\//i.test(nv.videoUrl || '') ? nv.videoUrl : '';
+                vDl.href = nvUrl || (nv.images && nv.images[0]) || '#';
+                var retryUrls = (nv.images && nv.images.length && !nvUrl) ? nv.images : [nvUrl || src];
                 doDownload(retryUrls);
               } else {
-                window.open(src, '_blank');
-                vNoteText.textContent = '代理下载多次失败，已在新窗口打开，请右键「另存为」。';
+                if(!safeOpenUrl(src)){ vNoteText.textContent = '链接无效，无法在新窗口打开。'; }
+                else { vNoteText.textContent = '代理下载多次失败，已在新窗口打开，请右键「另存为」。'; }
                 vDl.innerHTML = orig;
                 vDl.classList.remove('busy');
               }
             }).catch(function(){
-              window.open(src, '_blank');
-              vNoteText.textContent = '重新解析失败，已在新窗口打开原链接。';
+              if(!safeOpenUrl(src)){ vNoteText.textContent = '链接无效，无法在新窗口打开。'; }
+              else { vNoteText.textContent = '重新解析失败，已在新窗口打开原链接。'; }
               vDl.innerHTML = orig;
               vDl.classList.remove('busy');
             });
           } else {
-            window.open(src, '_blank');
-            vNoteText.textContent = '当前网络下代理下载不可用，已在新窗口打开，请在新页面右键「另存为」。';
+            if(!safeOpenUrl(src)){ vNoteText.textContent = '链接无效，无法在新窗口打开。'; }
+            else { vNoteText.textContent = '当前网络下代理下载不可用，已在新窗口打开，请在新页面右键「另存为」。'; }
             vDl.innerHTML = orig;
             vDl.classList.remove('busy');
           }
@@ -747,6 +767,7 @@
   }
 
   function parse(){
+    if(btn.disabled) return; // 解析中防重入（回车键也会触发 parse）
     var raw = input.value.trim();
     if(!raw){ setStatus('请先粘贴一个视频链接', true); return; }
     var url = pickUrl(raw);

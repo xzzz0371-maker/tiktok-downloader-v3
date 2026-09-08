@@ -79,6 +79,16 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+// 属性值转义：引号也要转义，防止从属性中逃逸（escapeHtml 不会转义文本节点里的引号）
+function escapeAttr(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // ---------- 缓存 ----------
 async function saveCache(videos) {
   await chrome.storage.local.set({ cachedVideos: videos });
@@ -86,7 +96,16 @@ async function saveCache(videos) {
 
 async function loadCache() {
   const result = await chrome.storage.local.get('cachedVideos');
-  return result.cachedVideos || [];
+  return normalizeVideos(result.cachedVideos || []);
+}
+
+// 历史缓存里的 id 可能是 number（TikTok id 常超过 2^53，作为数字会丢精度），
+// 统一成字符串，否则与 dataset / downloadedIds / 去重 / 进度映射比较全部失效。
+function normalizeVideos(list) {
+  return (list || []).map(v => v && {
+    ...v,
+    id: v.id == null || v.id === '' ? String(Date.now()) : String(v.id)
+  });
 }
 
 // ---------- 状态 ----------
@@ -148,7 +167,7 @@ function renderCard(video, index) {
   const sizeStr = video.fileSize ? formatFileSize(video.fileSize) : '';
   const safeTitle = escapeHtml(video.title);
   const safeAuthor = escapeHtml(video.author);
-  const safeCover = (video.cover && /^https?:\/\//i.test(video.cover)) ? video.cover : '';
+  const safeCover = escapeAttr((video.cover && /^https?:\/\//i.test(video.cover)) ? video.cover : '');
   const langLabel = video.language ? `🌐 ${escapeHtml(video.language)}` : '';
   const likesLabel = video.likes ? `❤️ ${escapeHtml(video.likes)}` : '';
   const dateLabel = video.createTime ? `📅 ${escapeHtml(video.createTime)}` : '';
@@ -165,7 +184,7 @@ function renderCard(video, index) {
     </div>
     <div class="info">
       <button class="btn-delete-corner" data-del="${index}">✕</button>
-      <div class="title" data-preview="${index}" title="${safeTitle}">${safeTitle}</div>
+      <div class="title" data-preview="${index}" title="${escapeAttr(video.title)}">${safeTitle}</div>
       <div class="meta">
         <span class="author">👤 ${safeAuthor}</span>
         <span class="quality">${escapeHtml(qualityLabel)}</span>
@@ -293,19 +312,21 @@ function refreshVideoList(force) {
   if (!force) {
     const existing = videoList.querySelectorAll('.video-card');
     const oldCount = existing.length;
-    // 数量相同：比对 id 序列，未变则完全跳过（打开插件/状态刷新时避免重复全量重建导致闪烁）
-    if (oldCount > 0 && parsedVideos.length === oldCount) {
-      const ids = Array.from(existing).map(c => c.dataset.videoId);
-      const same = parsedVideos.every((v, i) => v.id === ids[i]);
-      if (same) return;
-    }
-    // 解析是顺序追加：新列表更长时只追加新增卡片，保留已有卡片 DOM（封面图、滚动位置不丢）
-    if (oldCount > 0 && parsedVideos.length > oldCount) {
-      for (let i = oldCount; i < parsedVideos.length; i++) {
-        renderCard(parsedVideos[i], i);
+    if (oldCount > 0) {
+      const domIds = Array.from(existing).map(c => c.dataset.videoId);
+      const newIds = parsedVideos.map(v => v.id);
+      // 数量相同且 id 序列一致：完全跳过（打开插件/状态刷新时避免重复全量重建导致闪烁）
+      if (parsedVideos.length === oldCount && newIds.every((id, i) => id === domIds[i])) return;
+      // 新列表只是旧列表的“尾部追加”（头部序列一致）时才增量渲染，保留已有卡片 DOM。
+      // 注意：后台合并缓存时新结果是 unshift 到最前面的，若头部不一致必须整表重建，
+      // 否则会漏掉新视频并把旧卡片错误复用（出现重复卡片）。
+      if (parsedVideos.length > oldCount && newIds.slice(0, oldCount).every((id, i) => id === domIds[i])) {
+        for (let i = oldCount; i < parsedVideos.length; i++) {
+          renderCard(parsedVideos[i], i);
+        }
+        updateToolbar();
+        return;
       }
-      updateToolbar();
-      return;
     }
   }
   videoList.innerHTML = '';
@@ -327,8 +348,11 @@ function updateDownloadedBadges() {
     if (done && !isMarked) {
       btn.classList.add('btn-downloaded');
       btn.textContent = '✓';
+      btn.title = '已下载，点击重新下载';
     } else if (!done && isMarked) {
       btn.classList.remove('btn-downloaded');
+      btn.textContent = '⬇';
+      btn.title = '下载';
     }
   });
 }
@@ -419,7 +443,16 @@ function handleDownload(index) {
   }, (response) => {
     updateStatus();
     if (response && response.success) {
-      showToast('✅ 下载已开始');
+      // 后台在下载全部结束后才回包（单视频等待完成；图集等待所有图片结束），
+      // 所以这里可以放心把卡片标记为完成态，避免进度事件与回包之间的竞态显示
+      if (response.error && /图集下载/.test(response.error)) {
+        showToast('⚠️ ' + response.error);
+      } else {
+        showToast('✅ 下载完成');
+      }
+      currentDownloads[video.id] = { state: 'complete', bytesReceived: 0, totalBytes: 0 };
+      const card = findCardByVideoId(video.id);
+      if (card) applyDownloadProgressToCard(card, currentDownloads[video.id]);
     } else {
       const errMsg = response?.reason || response?.error || '未知错误';
       showToast('❌ 下载失败：' + errMsg);
@@ -484,7 +517,7 @@ function downloadAllVideos() {
 async function restoreCache() {
   const cached = await loadCache();
   if (cached && cached.length > 0) {
-    parsedVideos = cached;
+    parsedVideos = normalizeVideos(cached);
     refreshVideoList();
   }
 }
@@ -634,8 +667,8 @@ async function clearAll() {
   currentDownloads = {};
   await chrome.storage.local.remove('cachedVideos');
   hideStatus();
-  updateToolbar();
-  videoList.innerHTML = `<div class="empty-state"><div class="empty-icon">🎬</div><p>粘贴链接开始解析</p></div>`;
+  // 统一走 refreshVideoList 渲染标准空态，避免手工 innerHTML 与空态模板不一致
+  refreshVideoList(true);
 }
 
 // ============================================================
@@ -757,7 +790,7 @@ function setupEvents() {
       for (const downloadId in progressMap) {
         const p = progressMap[downloadId];
         if (p?.videoId) {
-          newDownloads[p.videoId] = {
+          newDownloads[String(p.videoId)] = {
             state: p.state,
             bytesReceived: p.bytesReceived || 0,
             totalBytes: p.totalBytes || 0,
@@ -772,14 +805,14 @@ function setupEvents() {
 
     // 缓存视频变化
     if (changes.cachedVideos && !changes.parseProgress) {
-      const newVideos = changes.cachedVideos.newValue || [];
+      const newVideos = normalizeVideos(changes.cachedVideos.newValue || []);
       parsedVideos = newVideos;
       refreshVideoList();
     }
 
     // 下载历史变化：只更新徽标和计数，不重建列表（避免整表闪烁）
     if (changes.downloadedIds) {
-      downloadedIds = new Set(changes.downloadedIds.newValue || []);
+      downloadedIds = new Set((changes.downloadedIds.newValue || []).map(String));
       updateHistoryToolbar();
       updateDownloadedBadges();
     }
@@ -818,7 +851,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       for (const downloadId in stored.downloadProgress) {
         const p = stored.downloadProgress[downloadId];
         if (p?.videoId) {
-          newDownloads[p.videoId] = {
+          newDownloads[String(p.videoId)] = {
             state: p.state,
             bytesReceived: p.bytesReceived || 0,
             totalBytes: p.totalBytes || 0,
@@ -835,32 +868,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 恢复下载历史
   try {
     const stored = await chrome.storage.local.get('downloadedIds');
-    downloadedIds = new Set(stored.downloadedIds || []);
+    downloadedIds = new Set((stored.downloadedIds || []).map(String));
     updateHistoryToolbar();
   } catch (e) {}
 
-  // 自动抓取当前页
-  setTimeout(async () => {
-    try {
-      const progress = await checkParseProgress();
-      if (progress?.status === 'running') return;
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tabs?.[0]?.url) {
-        const url = tabs[0].url;
-        // 只在视频详情页和首页/推荐页自动解析，搜索页/用户主页不自动解析
-        const isVideoPage = url.includes('/video/') || url.includes('/v/') || url.includes('v.douyin.com')
-                        || /^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)/.test(url)
-                        || /^https?:\/\/(www\.)?tiktok\.com\/foryou\/?(\?|$)/.test(url)
-                        || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)/.test(url)
-                        || /^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/foryou\/?(\?|$)/.test(url)
-                        || /^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url);
-        if (isVideoPage) {
-          urlInput.value = url;
-          handleParse(false);
-        }
-      }
-    } catch (e) {}
-  }, 400);
+  // 注：自动抓取/自动解析当前视频页由下方 setupAutoParse 统一处理（覆盖视频页/首页/推荐页/搜索页/
+  // 标签页/用户主页，且在弹窗/侧边栏/独立窗口三种模式共用）。这里不再单独开一个 400ms 定时器，
+  // 否则会与 setupAutoParse 的首次触发重复提交解析。
 
   // ===== 共享：自动解析目标判定（视频页/推荐页/搜索页/标签页/用户主页） =====
   async function getAutoParseTarget(tab) {
@@ -908,7 +922,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           const target = await getAutoParseTarget(t);
           if (target && target !== lastAutoParsedUrl) {
             lastAutoParsedUrl = target;
-            urlInput.value = target;
+            // 追加而不是覆盖输入框：不弄丢用户已经粘贴/输入的其它链接
+            const lines = (urlInput.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+            if (!lines.includes(target)) {
+              lines.push(target);
+              urlInput.value = lines.join('\n');
+            }
             handleParse(false); // 解析中也提交，后台会排队
             break;
           }

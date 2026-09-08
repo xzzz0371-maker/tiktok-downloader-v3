@@ -41,7 +41,9 @@
 body {
   width: 520px;
   max-width: 100vw;
-  height: 620px;
+  /* Chrome action popup 最大高度约 600px：超过会被裁掉底部，故固定为 600px 并配合
+     overflow:hidden + .app flex 布局，保证内容不跳动、不截断 */
+  height: 600px;
   background: var(--bg-gradient);
   color: var(--text);
   font-family: var(--font);

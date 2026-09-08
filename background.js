@@ -724,8 +724,8 @@ async function enrichVideoAsync(video) {
       const textForLang = comments.join(' ').length > 20 ? comments.join(' ') : video.title;
       video.language = await detectLanguage(textForLang);
 
-      const cached = await loadCachedVideos();
-      const idx = cached.findIndex(v => v.id === video.id);
+      const cached = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
+      const idx = cached.findIndex(v => v.id === String(video.id));
       if (idx !== -1) {
         cached[idx].language = video.language;
         await saveCachedVideos(cached);
@@ -1169,7 +1169,10 @@ async function parseVideo(url) {
       Promise.any(sources),
       new Promise((_, reject) => setTimeout(() => reject(new Error('并行解析总超时')), 12000))
     ]);
-    if (result?.success) return result;
+    if (result?.success) {
+      result.id = result.id == null || result.id === '' ? String(Date.now()) : String(result.id);
+      return result;
+    }
   } catch (e) {
     console.log('[并行解析] 全部失败或超时:', e.message);
   }
@@ -1181,6 +1184,7 @@ async function parseVideo(url) {
       result.originalUrl = finalUrl;
       result._parseSource = 'third_party';
       enrichVideoAsync(result);
+      result.id = result.id == null || result.id === '' ? String(Date.now()) : String(result.id);
       return result;
     } catch (e) { continue; }
   }
@@ -1249,11 +1253,11 @@ async function saveCachedVideos(videos) {
   await chrome.storage.local.set({ cachedVideos: videos });
 }
 
-async function updateParseProgress(patch) {
-  if (parseTask) {
-    Object.assign(parseTask, patch);
-    await chrome.storage.local.set({ parseProgress: { ...parseTask, queueLength: parseQueue.length } });
-  }
+async function updateParseProgress(patch, task) {
+  const current = task || parseTask;
+  if (!current) return;
+  Object.assign(current, patch);
+  await chrome.storage.local.set({ parseProgress: { ...current, queueLength: parseQueue.length } });
 }
 
 // 处理队列中的下一个任务
@@ -1261,29 +1265,34 @@ function processNextParseTask() {
   if (parseTask?.status === 'running') return;
   if (parseQueue.length === 0) return;
   const next = parseQueue.shift();
-  startBackgroundParse(next.urls, next.allowDuplicate, true);
+  startBackgroundParse(next.urls, next.allowDuplicate);
 }
 
-async function startBackgroundParse(urls, allowDuplicate = false, fromQueue = false) {
-  if (parseTask?.status === 'running') {
-    // 正在解析中，加入队列等待
+async function startBackgroundParse(urls, allowDuplicate = false) {
+  // 只要已有任务存在（运行中，或已 done 但尚未被上一个任务收尾清空），一律先排队，
+  // 由上一个任务收尾后统一启动，避免两个并发任务互相覆盖 parseTask，
+  // 导致收尾逻辑把新任务的 parseTask 置 null / 写入错误状态（旧 bug）。
+  if (parseTask) {
     parseQueue.push({ urls, allowDuplicate });
     return { success: true, queued: true, total: urls.length, queueLength: parseQueue.length };
   }
 
-  parseTask = {
+  const task = {
     id: Date.now(), total: urls.length, completed: 0,
     success: 0, failed: 0, skipped: 0, status: 'running', startedAt: Date.now()
   };
+  parseTask = task;
   stopParseRequested = false;
-  await chrome.storage.local.set({ parseProgress: { ...parseTask, queueLength: parseQueue.length } });
+  await chrome.storage.local.set({ parseProgress: { ...task, queueLength: parseQueue.length } });
 
   (async () => {
+    try {
     const results = [];
     const failedUrls = [];
     let skippedCount = 0;
     let completed = 0;
-    const existing = await loadCachedVideos();
+    // 统一字符串 id：历史缓存里可能存在 number/string 混存或超过 2^53 丢失精度的 id
+    const existing = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
     const concurrency = 8;
     let index = 0;
 
@@ -1312,10 +1321,14 @@ async function startBackgroundParse(urls, allowDuplicate = false, fromQueue = fa
         try {
           const result = await parseWithRetry(urls[i]);
           if (result.success) {
-            const exists = existing.some(v => v.id === result.id);
-            const dupInResults = results.some(v => v.id === result.id);
+            const vid = String(result.id);
+            const exists = existing.some(v => v.id === vid);
+            const dupInResults = results.some(v => String(v.id) === vid);
             if (!allowDuplicate && exists) skippedCount++;
-            else if (!dupInResults) results.push(result);
+            else if (!dupInResults) {
+              result.id = vid;
+              results.push(result);
+            }
           } else {
             failedUrls.push(urls[i]);
           }
@@ -1325,7 +1338,7 @@ async function startBackgroundParse(urls, allowDuplicate = false, fromQueue = fa
         await updateParseProgress({
           completed, success: results.length,
           failed: failedUrls.length, skipped: skippedCount
-        });
+        }, task);
       }
     }
 
@@ -1333,8 +1346,8 @@ async function startBackgroundParse(urls, allowDuplicate = false, fromQueue = fa
     for (let w = 0; w < Math.min(concurrency, urls.length); w++) workers.push(worker());
     await Promise.all(workers);
 
-    // 合并到缓存
-    let allVideos = await loadCachedVideos();
+    // 合并到缓存（历史缓存 id 统一为字符串，新结果放最前）
+    let allVideos = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
     for (let i = results.length - 1; i >= 0; i--) allVideos.unshift(results[i]);
     // 缓存上限：最多保留 200 条，防止爆存储
     if (allVideos.length > 200) allVideos = allVideos.slice(0, 200);
@@ -1343,26 +1356,37 @@ async function startBackgroundParse(urls, allowDuplicate = false, fromQueue = fa
     // 异步获取文件大小（用 id 查找，避免 index 错位）
     results.forEach((v) => fetchVideoSizeInBackground(v));
 
-    parseTask.status = 'done';
-    parseTask.completedAt = Date.now();
-    await chrome.storage.local.set({ parseProgress: { ...parseTask, queueLength: parseQueue.length } });
+    task.status = 'done';
+    task.completedAt = Date.now();
+    await chrome.storage.local.set({ parseProgress: { ...task, queueLength: parseQueue.length } });
 
     let msg = `已解析 ${results.length} 个视频`;
     if (skippedCount > 0) msg += `，跳过 ${skippedCount} 个已存在`;
     if (failedUrls.length > 0) msg += `，${failedUrls.length} 个失败`;
+    const title = task.stopped ? '⏹ 已停止解析' : (results.length > 0 ? '✅ 解析完成' : '⚠️ 解析完成');
 
     showNotification({
       type: 'basic', iconUrl: 'icons/icon128.png',
-      title: results.length > 0 ? '✅ 解析完成' : '⚠️ 解析完成',
-      message: msg, priority: 2
+      title, message: msg, priority: 2
     });
-    parseTask = null;
-
-    // 处理队列中的下一个任务
-    setTimeout(processNextParseTask, 300);
+    } finally {
+      // 无论成功、停止还是意外异常：只有 parseTask 仍指向本任务时才清空，
+      // 防止误清随后启动的新任务；并驱动队列继续运行，避免 parseTask 永久卡住。
+      // 若中途异常退出（非正常 done），补写终止态，防止 popup 一直停留在“解析中”
+      if (parseTask === task) {
+        if (task.status !== 'done') {
+          task.status = 'done';
+          task.completedAt = Date.now();
+          task.error = true;
+          chrome.storage.local.set({ parseProgress: { ...task, queueLength: parseQueue.length } }).catch(() => {});
+        }
+        parseTask = null;
+        setTimeout(processNextParseTask, 300);
+      }
+    }
   })();
 
-  return { success: true, taskId: parseTask.id, total: urls.length };
+  return { success: true, taskId: task.id, total: urls.length };
 }
 
 // 后台获取文件大小（按 video.id 查找，修复 index 错位 bug）
@@ -1375,9 +1399,9 @@ async function fetchVideoSizeInBackground(video) {
     if (!len) return;
     const fileSize = parseInt(len);
 
-    // 重新读取最新缓存，按 id 查找后更新
-    const current = await loadCachedVideos();
-    const idx = current.findIndex(v => v.id === video.id);
+    // 重新读取最新缓存，按 id 查找后更新（字符串化比较，兼容历史缓存中的 number/string id）
+    const current = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
+    const idx = current.findIndex(v => v.id === String(video.id));
     if (idx !== -1) {
       current[idx].fileSize = fileSize;
       await saveCachedVideos(current);
@@ -1432,7 +1456,7 @@ function translateDownloadError(errorCode) {
 //  模块九：下载核心（优化版）
 // ============================================================
 
-// ---------- 图集下载：逐张下载图片 ----------
+// ---------- 图集下载：逐张下载图片（监听每张完成/失败，结束后清理进度） ----------
 async function downloadPhotoImages(video, language = '') {
   const images = (Array.isArray(video.images) ? video.images : []).filter(u => u && /^https?:/.test(u));
   if (!images.length) return { success: false, error: '无图片链接' };
@@ -1440,31 +1464,66 @@ async function downloadPhotoImages(video, language = '') {
   if (safeAuthor.length > 50) safeAuthor = safeAuthor.substring(0, 50);
   const dateStr = video.createTime ? String(video.createTime).replace(/[^\d.]/g, '') : '';
   const base = [video.likes, dateStr, safeAuthor].filter(Boolean).join('_') || 'tiktok_photo';
-  let ok = 0;
+  const downloadIds = [];
+
+  // 启动一张图片：直连下载；被拒/失败时自动改走自建代理
+  const startOne = (imageUrl, filename) => new Promise((resolve) => {
+    chrome.downloads.download({ url: imageUrl, filename, saveAs: false }, (id) => {
+      if (chrome.runtime.lastError || !id) {
+        // 直连失败 → 自建代理兜底
+        chrome.downloads.download({ url: OWN_PROXY_API + encodeURIComponent(imageUrl), filename, saveAs: false }, (id2) => {
+          if (chrome.runtime.lastError || !id2) { resolve(null); return; }
+          updateDownloadProgress(id2, { videoId: video.id, filename, state: 'in_progress', bytesReceived: 0, totalBytes: 0, startTime: Date.now() });
+          resolve(id2);
+        });
+        return;
+      }
+      updateDownloadProgress(id, { videoId: video.id, filename, state: 'in_progress', bytesReceived: 0, totalBytes: 0, startTime: Date.now() });
+      resolve(id);
+    });
+  });
+
   for (let i = 0; i < images.length; i++) {
     const m = images[i].match(/\.(png|jpe?g|webp)/i);
     const ext = m ? (m[1].toLowerCase() === 'jpeg' ? 'jpg' : m[1].toLowerCase()) : 'jpg';
     const filename = base + '_photo_' + String(i + 1).padStart(2, '0') + '.' + ext;
     try {
-      // 直连下载；被拒时（CDN 校验严格域）自动改走自建代理
-      let id = await new Promise((resolve) => {
-        chrome.downloads.download({ url: images[i], filename, saveAs: false }, (did) => {
-          if (chrome.runtime.lastError) resolve(null); else resolve(did);
-        });
-      });
-      if (!id) {
-        id = await new Promise((resolve) => {
-          chrome.downloads.download({ url: OWN_PROXY_API + encodeURIComponent(images[i]), filename, saveAs: false }, (did) => {
-            if (chrome.runtime.lastError) resolve(null); else resolve(did);
-          });
-        });
-      }
-      if (id) {
-        ok++;
-        updateDownloadProgress(id, { videoId: video.id, filename, state: 'in_progress', bytesReceived: 0, totalBytes: 0, startTime: Date.now() });
-      }
+      const id = await startOne(images[i], filename);
+      if (id) downloadIds.push(id);
     } catch (e) {}
   }
+  if (downloadIds.length === 0) return { success: false, error: '图片下载创建失败', url: images[0] };
+
+  // 等待单张图片结束（complete / interrupted / 超时），结束后写状态并清理进度
+  const waitFinish = (downloadId) => new Promise((resolve) => {
+    let settled = false;
+    const finish = (state, error) => {
+      if (settled) return;
+      settled = true;
+      chrome.downloads.onChanged.removeListener(listener);
+      clearTimeout(timer);
+      updateDownloadProgress(downloadId, { state, error: error || '' });
+      setTimeout(() => removeDownloadProgress(downloadId), 5000);
+      resolve(state === 'complete');
+    };
+    const listener = (delta) => {
+      if (delta.id !== downloadId || settled) return;
+      if (delta.state?.current === 'complete') finish('complete');
+      else if (delta.error?.current) finish('error', translateDownloadError(delta.error.current));
+    };
+    chrome.downloads.onChanged.addListener(listener);
+    // 处理“监听挂上之前就已结束”的极快下载
+    chrome.downloads.search({ id: downloadId }, (items) => {
+      const it = items && items[0];
+      if (!it || settled) return;
+      if (it.state === 'complete') finish('complete');
+      else if (it.state === 'interrupted') finish('error', translateDownloadError(it.error || '未知错误'));
+    });
+    const timer = setTimeout(() => finish('error', '图片下载超时'), 60000);
+  });
+
+  const states = await Promise.all(downloadIds.map(waitFinish));
+  const ok = states.filter(Boolean).length;
   if (ok > 0) await recordDownloadedVideo(video.id);
   return ok === images.length
     ? { success: true, url: images[0] }
@@ -1563,6 +1622,29 @@ async function downloadSingleVideo(video, language = '') {
         }
       };
       chrome.downloads.onChanged.addListener(listener);
+      // 兜底：下载可能在监听挂上之前就已结束（文件极小或立即失败），主动查一次当前状态，
+      // 否则这类下载会一直等到 DOWNLOAD_TIMEOUT 被误判为“下载超时”。
+      chrome.downloads.search({ id: downloadId }, (items) => {
+        if (settled) return;
+        const it = items && items[0];
+        if (!it) return;
+        if (it.state === 'complete') {
+          settled = true;
+          chrome.downloads.onChanged.removeListener(listener);
+          updateDownloadProgress(downloadId, { state: 'complete', bytesReceived: it.bytesReceived || 0 });
+          console.log(`[下载] 完成: ${filename}`);
+          setTimeout(() => removeDownloadProgress(downloadId), 5000);
+          resolve({ success: true });
+        } else if (it.state === 'interrupted') {
+          settled = true;
+          chrome.downloads.onChanged.removeListener(listener);
+          const errMsg = translateDownloadError(it.error || '未知错误');
+          updateDownloadProgress(downloadId, { state: 'error', error: errMsg });
+          setTimeout(() => removeDownloadProgress(downloadId), 8000);
+          console.warn(`[下载] 错误: ${errMsg}`);
+          resolve({ success: false, error: errMsg });
+        }
+      });
       setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -1628,10 +1710,11 @@ async function downloadSingleVideo(video, language = '') {
 let _downloadedQueue = Promise.resolve();
 async function recordDownloadedVideo(videoId) {
   if (!videoId) return;
+  videoId = String(videoId);
   _downloadedQueue = _downloadedQueue.then(async () => {
     try {
       const storage = await chrome.storage.local.get('downloadedIds');
-      const ids = storage.downloadedIds || [];
+      const ids = (storage.downloadedIds || []).map(String);
       if (!ids.includes(videoId)) {
         ids.push(videoId);
         // 最多保留 500 条，避免无限增长
@@ -1824,15 +1907,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'stop-parse') {
-    // 停止当前解析任务
+    // 停止当前解析任务：只做标记 + 清空排队，不要直接把 parseTask 置 null。
+    // 后台收尾的异步任务结束后仍会写 parseTask.status；直接置 null 会让它在
+    // 收尾处抛 TypeError（旧 bug），并可能让随后启动的新任务被旧收尾逻辑误清。
     stopParseRequested = true;
-    if (parseTask) {
+    parseQueue = []; // 立即清空排队任务
+    if (parseTask?.status === 'running') {
+      parseTask.stopped = true;
       parseTask.status = 'done';
       parseTask.completedAt = Date.now();
-      parseTask.stopped = true;
-      chrome.storage.local.set({ parseProgress: { ...parseTask, queueLength: parseQueue.length } });
-      parseTask = null;
-      parseQueue = []; // 清空队列
+      chrome.storage.local.set({ parseProgress: { ...parseTask, queueLength: 0 } });
       sendResponse({ success: true, stopped: true });
     } else {
       // 清理 storage 里可能残留的 running 状态

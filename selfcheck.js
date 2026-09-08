@@ -52,7 +52,7 @@ try {
   else ok('popup.css 无 backdrop-filter');
   if (!css.includes('scrollbar-gutter: stable')) bad('popup.css 缺 scrollbar-gutter（左右跳隐患）');
   else ok('popup.css scrollbar-gutter 存在');
-  if (!css.includes('  height: 620px;')) bad('popup.css body 未固定 620px（高度跳隐患）');
+  if (!css.includes('  height: 600px;')) bad('popup.css body 未固定 600px（Chrome popup 最大高度约 600，超过会被截断）');
   else ok('popup.css body 固定高度');
   if (!/^\.app \{[\s\S]*?display: flex;[\s\S]*?flex-direction: column;/m.test(css)) bad('popup.css 缺全局 .app flex');
   else ok('popup.css 全局 .app flex');
@@ -69,7 +69,7 @@ console.log('=== 3. 功能链路（插件） ===');
     ['下载三级兜底（尝试2/3）', bg.includes('尝试2：重新解析') && bg.includes('尝试3：自建代理')],
     ['代理用新链接', bg.includes('const proxyTarget = (newUrl && newUrl !== url) ? newUrl : url;')],
     ['代理失败重试', bg.includes('代理首次失败，重试')],
-    ['图集代理兜底', bg.includes('OWN_PROXY_API + encodeURIComponent(images[i])')],
+    ['图集代理兜底', bg.includes('OWN_PROXY_API + encodeURIComponent(imageUrl)')],
     ['recommend-auto-parse 监听', bg.includes("type === 'recommend-auto-parse'")],
     ['download-single 监听', bg.includes("type === 'download-single'")],
     ['download-all-background 监听', bg.includes("type === 'download-all-background'")],
