@@ -33,6 +33,17 @@ const OWN_PARSE_TOKEN = 'tdp2026x7kq9mz3vn8clw4r';
 // 自建下载代理（服务器带 Cookie+Referer 拉流，直连被拒时的兜底通道）
 const OWN_PROXY_API = 'https://tiktok-downloader-av8.pages.dev/api/proxy?url=';
 
+// 全局错误捕获：后台脚本在个别浏览器（如豆包）可能因某个 API 缺失/受限而在
+// 启动阶段抛错导致“手动解析/自动解析全部无响应”，这里把错误打印到 SW 控制台便于排查
+try {
+  self.addEventListener('error', (e) => {
+    try { console.error('[SW error]', e && (e.message || (e.error && e.error.message) || String(e.error))); } catch (_) {}
+  });
+  self.addEventListener('unhandledrejection', (e) => {
+    try { console.error('[SW unhandledrejection]', e && e.reason); } catch (_) {}
+  });
+} catch (_) {}
+
 // ---------- 工具函数 ----------
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -1924,6 +1935,14 @@ chrome.commands.onCommand.addListener(async (command) => {
 //  模块十一：消息监听
 // ============================================================
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // 心跳：弹窗/内容脚本用来确认后台脚本可用（个别浏览器后台启动失败时便于提示用户）
+  if (message.type === 'ping') {
+    try {
+      sendResponse({ ok: true, version: chrome.runtime.getManifest().version, ts: Date.now() });
+    } catch (e) { sendResponse({ ok: false }); }
+    return true;
+  }
+
   if (message.type === 'start-parse') {
     const urls = message.urls || [];
     const allowDuplicate = message.allowDuplicate !== false;

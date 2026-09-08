@@ -488,12 +488,15 @@ function handleDownload(index) {
       const card = findCardByVideoId(video.id);
       if (card) applyDownloadProgressToCard(card, currentDownloads[video.id]);
     } else {
-      const errMsg = response?.reason || response?.error || '未知错误';
-      showToast('❌ 下载失败：' + errMsg);
+      const lastErr = chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      const offline = !response && /Receiving end|message port|Could not establish|Extension context invalidated/i.test(lastErr || '');
+      const errMsg = response?.reason || response?.error || lastErr || '未知错误';
+      showToast(offline ? '❌ 后台未响应：请在扩展管理页重新加载本扩展' : ('❌ 下载失败：' + errMsg));
       // 更新为错误状态
       currentDownloads[video.id] = { state: 'error', error: errMsg, bytesReceived: 0, totalBytes: 0 };
       const card = findCardByVideoId(video.id);
       if (card) applyDownloadProgressToCard(card, currentDownloads[video.id]);
+      if (offline) showBgOffline();
       console.error('[下载失败]', errMsg, '链接:', video.videoUrl || video.hdVideoUrl);
     }
   });
@@ -628,6 +631,43 @@ function applyTheme(theme) {
   themeToggle.textContent = theme === 'dark' ? '☀️' : '🌙';
 }
 
+// 后台是否存活：个别浏览器（如豆包）后台 Service Worker 可能启动失败，
+// 先检测再提示，避免“点了解析/下载没反应”。
+function checkBackgroundReady() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    try {
+      chrome.runtime.sendMessage({ type: 'ping' }, (resp) => {
+        if (chrome.runtime.lastError) finish(false);
+        else finish(!!(resp && resp.ok));
+      });
+    } catch (e) { finish(false); }
+    setTimeout(() => finish(false), 2000);
+  });
+}
+
+// 后台不可用提示（解析/下载都会无响应时的明确反馈）
+function showBgOffline() {
+  statusText.innerHTML = '⚠️ 后台未响应：请在扩展管理页重新加载本扩展；若仍无效，请查看后台 Service Worker 控制台错误';
+  statusText.style.color = '#ff6b6b';
+  try {
+    console.error('[bg-offline] 后台 ping 多次无响应（常见于豆包等浏览器对扩展限制，或 SW 启动报错）');
+  } catch (e) {}
+}
+
+// 检查扩展后台服务是否可用，重试 3 次避免误报（SW 冷启动需要时间）
+function detectBackground() {
+  let attempts = 0;
+  const tryPing = () => checkBackgroundReady().then((ready) => {
+    if (ready) { updateStatus(); return; }
+    attempts++;
+    if (attempts < 3) setTimeout(tryPing, 800);
+    else showBgOffline();
+  });
+  tryPing();
+}
+
 // ============================================================
 //  后台解析相关
 // ============================================================
@@ -699,7 +739,14 @@ async function handleParse(allowDuplicate = false, silent = false) {
       parseBtn.textContent = '解析中';
       stopParseBtn.style.display = '';
     } else {
-      showToast('❌ ' + (response?.reason || '提交解析失败'));
+      const lastErr = chrome.runtime.lastError ? chrome.runtime.lastError.message : '';
+      const offline = !response && /Receiving end|message port|Could not establish|Extension context invalidated/i.test(lastErr || '');
+      if (offline) {
+        showToast('❌ 后台未响应：请在扩展管理页重新加载本扩展');
+        showBgOffline();
+      } else {
+        showToast('❌ ' + (response?.reason || lastErr || '提交解析失败'));
+      }
     }
   });
 }
@@ -901,6 +948,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 检查是否有正在进行的后台解析
   await checkParseProgress();
+
+  // 后台存活检测（个别浏览器后台启动失败时给出明确提示）
+  detectBackground();
 
   // 恢复当前下载进度
   try {
