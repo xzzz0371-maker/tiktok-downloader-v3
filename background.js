@@ -1583,11 +1583,12 @@ async function downloadSingleVideo(video, language = '') {
   }
 
   // 尝试2：重新解析拿新签名链接再直连（仅一次，防递归）
+  let newUrl = '';
   if (!video._retried && video.originalUrl) {
     try {
       const re = await parseVideo(video.originalUrl);
       if (re && re.success) {
-        const newUrl = (re.hdVideoUrl || re.videoUrl || '').trim();
+        newUrl = (re.hdVideoUrl || re.videoUrl || '').trim();
         if (newUrl && newUrl !== url) {
           console.log('[下载] 直连被拒，重新解析成功，换新链接重试');
           const r2 = await runDownload(newUrl);
@@ -1602,9 +1603,17 @@ async function downloadSingleVideo(video, language = '') {
 
   // 尝试3：自建代理兜底（服务器带 Cookie+Referer 拉流，直连/换链均被拒时成功率高）
   if (!video._proxyTried) {
-    const proxyUrl = OWN_PROXY_API + encodeURIComponent(url);
+    // 优先用重新解析后的新签名链接（旧链接可能已过期，代理也拉不到）
+    const proxyTarget = (newUrl && newUrl !== url) ? newUrl : url;
+    const proxyUrl = OWN_PROXY_API + encodeURIComponent(proxyTarget);
     console.log('[下载] 直连失败，改走自建代理');
-    const r3 = await runDownload(proxyUrl);
+    let r3 = await runDownload(proxyUrl);
+    // Akamai 对数据中心 IP 间歇风控：代理失败后重试一次
+    if (!r3.success) {
+      await new Promise(r => setTimeout(r, 1200));
+      console.log('[下载] 代理首次失败，重试');
+      r3 = await runDownload(proxyUrl);
+    }
     if (r3.success) {
       await recordDownloadedVideo(video.id);
       return { ...r3, url: proxyUrl, viaProxy: true };
