@@ -1592,6 +1592,38 @@ async function downloadPhotoImages(video, language = '') {
     ? { success: true, url: images[0] }
     : { success: ok > 0, error: '图集下载 ' + ok + '/' + images.length + ' 张成功', url: images[0] };
 }
+// ============================================================
+//  下载策略增强（方案 C/A/D）
+// ============================================================
+
+// C：允许“浏览器直连下载”的 CDN 主机（不带 Referer/Cookie 也大概率放行）。
+// 名单外的域名（Akamai 等校验严格）一律跳过直连、直接走代理，省掉注定失败的直连轮次。
+const DIRECT_FRIENDLY_HOSTS = [
+  'douyinvod.com', 'douyinpic.com', 'douyinstatic.com', 'zjcdn.com', 'bytecdn.cn',
+  'bytecdntp.com', 'amemv.com', 'muscdn.com', 'ibytedtos.com'
+];
+function isDirectFriendlyHost(rawUrl) {
+  try {
+    const h = new URL(rawUrl).hostname.toLowerCase();
+    if (h.includes('tiktokcdn') || h === 'webapp-prime.tiktok.com' || h.endsWith('-webapp-prime.tiktok.com')
+        || h === 'tiktokv.com' || h.endsWith('.tiktokv.com')) return true;
+    return DIRECT_FRIENDLY_HOSTS.some(d => h === d || h.endsWith('.' + d));
+  } catch (e) { return false; }
+}
+
+// A：走代理前先让自建代理 HEAD 探测一次（校验 200/206 + 内容类型），
+// 把“过期签名 / 被风控 / 错误页”的候选拦在发起下载之前，避免白等一轮失败下载。
+async function probeProxyCandidate(proxyUrl) {
+  try {
+    const resp = await fetchWithTimeout(proxyUrl, { method: 'HEAD', headers: { 'Range': 'bytes=0-0' } }, 5000);
+    if (!resp.ok) return false;
+    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    // 明确是网页/JSON/文本 → 判定为错误页（CDN 对过期链接常返回 200+HTML）
+    if (ct && (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain'))) return false;
+    return true;
+  } catch (e) { return false; }
+}
+
 async function downloadSingleVideo(video, language = '') {
   const url = (video.hdVideoUrl || video.videoUrl || '').trim();
   // 图集：无视频链接但有图片列表 → 逐张下载图片
@@ -1763,20 +1795,30 @@ async function downloadSingleVideo(video, language = '') {
     }
   }
 
-  // 2) 候选地址去重排序：新签名 → 缓存高清 → 备用地址 → 解析源普通地址
+  // 2) 候选地址去重排序：新签名 → 缓存高清 → 备用地址 → 解析源普通地址。
+  //    D：m3u8(HLS) 无法被浏览器直接存成可用 mp4，直接剔除，避免下到一堆没用的分片清单
+  const hlsCandidates = [];
   const candidates = [];
   const pushCand = (u) => {
     u = (u || '').trim();
-    if (u && !candidates.includes(u)) candidates.push(u);
+    if (!u || candidates.includes(u) || hlsCandidates.includes(u)) return;
+    if (/\.m3u8(\?|$)/i.test(u)) hlsCandidates.push(u);
+    else candidates.push(u);
   };
   pushCand(freshUrl);
   pushCand(url);
   pushCand(freshAltUrl);
   pushCand(video.videoUrl);
-  if (candidates.length === 0) return { success: false, error: '无视频链接', url: null };
+  if (candidates.length === 0) {
+    return hlsCandidates.length
+      ? { success: false, error: '该视频仅有 HLS(m3u8) 流，无法直接保存为 mp4，请换其它解析源', url: null }
+      : { success: false, error: '无视频链接', url: null };
+  }
 
-  // 3) 直连逐个尝试（住宅 IP 多数可直接下载；失败会快速返回，不会卡死）
-  for (const cand of candidates) {
+  // 3) 直连逐个尝试 —— C：只对“直连白名单 CDN”试直连；名单外的（Akamai 等校验严格）
+  //    跳过直连，直接进代理环节，不再为注定失败的直连空耗时间。
+  const directCandidates = candidates.filter(isDirectFriendlyHost);
+  for (const cand of directCandidates) {
     if (Date.now() - effortStart >= EFFORT_MS) break; // 预算耗尽，让位给队列里的其它视频
     const r = await runDownload(cand);
     if (r.success) {
@@ -1785,15 +1827,23 @@ async function downloadSingleVideo(video, language = '') {
     }
   }
 
-  // 4) 全部直连失败 → 自建代理逐个尝试（服务器带 Cookie+Referer，绕开直连被拒问题）。
-  //    每个候选失败后短暂等待重试一次（应对 CDN 对数据中心 IP 的间歇风控）。
+  // 4) 自建代理逐个尝试（服务器带 Cookie+Referer 拉流）。
+  //    A：先让代理 HEAD 探测候选是否真的可取流（200/206+视频类型），
+  //    探测不过的候选直接跳过，不发起注定失败的下载。
   let lastFail = null;
   let effortExhausted = false;
   for (const cand of candidates) {
     if (Date.now() - effortStart >= EFFORT_MS) { effortExhausted = true; break; }
     const proxyUrl = OWN_PROXY_API + encodeURIComponent(cand);
+    const probeOk = await probeProxyCandidate(proxyUrl);
+    if (!probeOk) {
+      console.log(`[下载] 代理探测不通过，跳过候选: ${cand.slice(0, 90)}`);
+      lastFail = { success: false, error: '代理探测不通过（链接可能已过期或被风控）' };
+      continue;
+    }
     console.log(`[下载] 代理尝试: ${cand.slice(0, 90)}`);
     let r3 = await runDownload(proxyUrl);
+    // 探测通过但下载仍失败（Akamai 等间歇风控）：短等后重试一次
     if (!r3.success) {
       await sleep(1200);
       r3 = await runDownload(proxyUrl);
