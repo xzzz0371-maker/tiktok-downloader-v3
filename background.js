@@ -1739,6 +1739,12 @@ async function downloadSingleVideo(video, language = '') {
   // 因此：原画质来源先做一次快速重解析拿到“新签名链接”，再按 新签名→旧地址 的顺序尝试，
   // 最后走代理兜底；保证一次点击内就把链路走完，不再拿过期链接空试。
 
+  // 单视频总耗时预算：批量下载是 3 并发，如果某个视频的地址一直挂着不放，
+  // 会长期占死 3 个槽位把后面的视频全堵住。预算耗尽就放弃该视频并释放槽位，
+  // 让队列继续下载后面的（downloadBatchConcurrent 也会跳过对它的二次重试）。
+  const EFFORT_MS = 70000; // 单视频最多折腾 70 秒
+  const effortStart = Date.now();
+
   // 1) 先取新签名（仅对“原画质/页内拦截/自建后端/页面解析”等易过期来源执行，避免普通高清多等一轮）
   const isFreshNeeded = /原画质/.test(String(video.quality || ''))
     || /intercept|universal|sigi|own_backend|fetch_|_page|page/i.test(String(video._parseSource || ''));
@@ -1771,6 +1777,7 @@ async function downloadSingleVideo(video, language = '') {
 
   // 3) 直连逐个尝试（住宅 IP 多数可直接下载；失败会快速返回，不会卡死）
   for (const cand of candidates) {
+    if (Date.now() - effortStart >= EFFORT_MS) break; // 预算耗尽，让位给队列里的其它视频
     const r = await runDownload(cand);
     if (r.success) {
       await recordDownloadedVideo(video.id);
@@ -1781,7 +1788,9 @@ async function downloadSingleVideo(video, language = '') {
   // 4) 全部直连失败 → 自建代理逐个尝试（服务器带 Cookie+Referer，绕开直连被拒问题）。
   //    每个候选失败后短暂等待重试一次（应对 CDN 对数据中心 IP 的间歇风控）。
   let lastFail = null;
+  let effortExhausted = false;
   for (const cand of candidates) {
+    if (Date.now() - effortStart >= EFFORT_MS) { effortExhausted = true; break; }
     const proxyUrl = OWN_PROXY_API + encodeURIComponent(cand);
     console.log(`[下载] 代理尝试: ${cand.slice(0, 90)}`);
     let r3 = await runDownload(proxyUrl);
@@ -1795,8 +1804,11 @@ async function downloadSingleVideo(video, language = '') {
       return { ...r3, url: proxyUrl, viaProxy: true };
     }
   }
+  if (effortExhausted && (!lastFail || !lastFail.error)) {
+    lastFail = { success: false, error: '下载超时（已尽力 70 秒，跳过该视频）' };
+  }
 
-  return { ...(lastFail || { success: false, error: '下载失败' }), url };
+  return { ...(lastFail || { success: false, error: '下载失败' }), url, _gaveUp: effortExhausted };
 }
 
 // ---------- 下载历史记录（串行队列，防止并发覆盖） ----------
@@ -1839,8 +1851,10 @@ async function downloadBatchConcurrent(videos, concurrency = 3, progressCallback
 
       let result = await downloadSingleVideo(video, video.language || '');
 
-      if (!result.success) {
-        await sleep(500); // 指数退避起点
+      // 失败重试一次；但若该视频已耗光单视频预算（_gaveUp），说明是顽固失败，
+      // 不再重试，立即释放并发槽位给后面的视频，避免队列被“下载不下来的视频”堵死。
+      if (!result.success && !result._gaveUp) {
+        await sleep(500);
         result = await downloadSingleVideo(video, video.language || '');
       }
 
