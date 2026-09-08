@@ -1487,6 +1487,8 @@ async function fetchVideoSizeInBackground(video) {
 //  模块八：下载进度管理
 // ============================================================
 const downloadProgressMap = new Map(); // downloadId -> progress info
+// 原画质(无水印)连续失败计数：key=videoId，失败满 3 次后允许自动降级到“高清/含带水印”地址下载
+const originalQualityFailCounts = new Map();
 let progressBroadcastTimer = null;
 
 // 节流广播：最多每 500ms 写一次 storage，避免频繁 IO
@@ -1667,6 +1669,18 @@ async function downloadSingleVideo(video, language = '') {
   }
   if (!url) return { success: false, error: '无视频链接', url: null };
 
+  // “原画质(无水印)”判定：失败满 3 次后允许自动降级到高清/带水印地址下载
+  const isOrigQuality = /原画质/.test(String(video.quality || ''))
+    || /intercept|universal|sigi|own_backend|fetch_|_page|page/i.test(String(video._parseSource || ''));
+  const failKey = isOrigQuality ? String(video.id || video.originalUrl || '') : '';
+  const allowFallback = isOrigQuality && (originalQualityFailCounts.get(failKey) || 0) >= 3;
+  const recordOrigFail = () => {
+    if (!failKey) return;
+    const n = (originalQualityFailCounts.get(failKey) || 0) + 1;
+    originalQualityFailCounts.set(failKey, n);
+    if (n === 3) console.log('[下载] 原画质已连续失败 3 次，之后将自动降级下载');
+  };
+
   // 构造文件名（点赞和日期放最前面）
   let safeAuthor = (video.author || 'unknown').replace(/[\\/:*?"<>|]/g, '_');
   if (safeAuthor.length > 50) safeAuthor = safeAuthor.substring(0, 50);
@@ -1835,24 +1849,30 @@ async function downloadSingleVideo(video, language = '') {
   //    D：m3u8(HLS) 无法被浏览器直接存成可用 mp4，剔除，避免下到一堆没用的分片清单。
   //    速度优先+强制无水印：URL 明显带水印(playwm/watermark=1/…)的一律不入候选。
   const hlsCandidates = [];
-  let rejectedWatermark = false;
+  const wmCandidates = []; // 带水印地址：默认不用；原画质失败满 3 次(allowFallback)才追加为最后保底
   const candidates = [];
   const pushCand = (u) => {
     u = (u || '').trim();
-    if (!u || candidates.includes(u) || hlsCandidates.includes(u)) return;
+    if (!u || candidates.includes(u) || hlsCandidates.includes(u) || wmCandidates.includes(u)) return;
     if (/\.m3u8(\?|$)/i.test(u)) hlsCandidates.push(u);
-    else if (looksWatermarked(u)) rejectedWatermark = true; // 不要带水印的
+    else if (looksWatermarked(u)) wmCandidates.push(u);
     else candidates.push(u);
   };
   pushCand(freshUrl);
   pushCand(url);
   pushCand(freshAltUrl);
   pushCand(video.videoUrl);
+  // 原画质已失败满 3 次 → 允许把带水印(高清)地址追加为降级候选，保证能下下来
+  if (allowFallback && wmCandidates.length) {
+    console.log('[下载] 原画质失败≥3次，追加降级候选（高清/带水印）');
+    candidates.push(...wmCandidates);
+  }
   if (candidates.length === 0) {
+    if (isOrigQuality) recordOrigFail();
     return hlsCandidates.length
       ? { success: false, error: '该视频仅有 HLS(m3u8) 流，无法直接保存为 mp4', url: null }
-      : rejectedWatermark
-        ? { success: false, error: '该视频当前只有带水印地址，已按要求不放行', url: null }
+      : wmCandidates.length
+        ? { success: false, error: '原画质暂不可用（失败未满 3 次，尚未降级）', url: null }
         : { success: false, error: '无视频链接', url: null };
   }
 
@@ -1899,6 +1919,8 @@ async function downloadSingleVideo(video, language = '') {
   if (effortExhausted && (!lastFail || !lastFail.error)) {
     lastFail = { success: false, error: '下载超时（已尽力 70 秒，跳过该视频）' };
   }
+  // 到这里仍未成功：原画质视频累计一次失败（满 3 次后下次起自动带降级候选）
+  if (isOrigQuality) recordOrigFail();
 
   return { ...(lastFail || { success: false, error: '下载失败' }), url, _gaveUp: effortExhausted };
 }
