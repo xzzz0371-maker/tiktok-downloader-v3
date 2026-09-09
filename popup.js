@@ -968,12 +968,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupEvents();
   updateToolbar();
 
-  // 恢复推荐页自动解析开关状态
+  // 恢复推荐页自动解析开关状态（默认关闭：只在用户打开视频页时自动解析当前视频）
   try {
     const recPref = await chrome.storage.local.get('recommendAutoParse');
-    recommendAutoParseToggle.checked = recPref.recommendAutoParse !== false;
+    recommendAutoParseToggle.checked = recPref.recommendAutoParse === true;
   } catch (e) {
-    recommendAutoParseToggle.checked = true;
+    recommendAutoParseToggle.checked = false;
   }
 
   // 检查是否有正在进行的后台解析
@@ -1023,7 +1023,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!/tiktok\.com|douyin\.com|iesdouyin\.com|tiktokv\.com/.test(url)) return '';
     // 明确不是视频内容的页面（帮助/版权/登录/下载/直播/广告等），直接排除
     if (/(^|\/)(about|legal|privacy|terms|community|guidelines|advertise|business|creator|download|login|signup|live)\b/i.test(url)) return '';
-    // 模态播放页：在首页/用户主页里点开视频，URL 仍是首页路径但带 modal_id=视频id
+    // 模态播放页：在首页/用户主页里“点开”视频，URL 仍是首页路径但带 modal_id=视频id
     try {
       const modal = new URL(url).searchParams.get('modal_id');
       if (modal && /^\d{8,}$/.test(modal)) {
@@ -1032,37 +1032,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           : `https://www.tiktok.com/video/${modal}`;
       }
     } catch (e) {}
-    // 视频详情页 / 图集（photo/slideshow/note）/ 短链：直接用页面 URL
+    // 只自动解析“打开就是单个内容”的页面：视频详情/图集（photo/slideshow/note）/短链。
+    // 首页/推荐/搜索/标签/用户主页等整页默认不自动解析（避免一次解析一大堆视频）。
     if (DETAIL_URL_RE.test(url)) return url;
-    // 其它（首页/推荐/搜索/标签/用户主页/发现页）：必须真能取到“视口内的视频链接”才自动解析
-    if (/\/search|\/tag\/|\/@|foryou|discover|^https?:\/\/(www\.)?tiktok\.com\/?(\?|$)|^https?:\/\/(www\.)?tiktok\.com\/[a-z]{2}\/?(\?|$)|^https?:\/\/(www\.)?douyin\.com\/?(\?|$)/.test(url)) {
-      try {
-        const res = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: () => {
-            // 页面里一个 /video/ 链接都没有（空白页、加载失败、无内容落地页）→ 直接返回空
-            const links = Array.from(document.querySelectorAll('a[href*="/video/"]'));
-            if (!links.length) return '';
-            for (const a of links) {
-              const r = a.getBoundingClientRect();
-              // 需要真实可见且有尺寸，避免取到隐藏/离屏的旧缓存 DOM
-              if (r.width > 20 && r.bottom > 0 && r.top < window.innerHeight) {
-                const m1 = a.href.match(/\/@([^\/?]+)\/video\/(\d{8,})/);
-                if (m1) return 'https://www.tiktok.com/@' + m1[1] + '/video/' + m1[2];
-                const m2 = a.href.match(/\/video\/(\d{8,})/);
-                if (m2) return 'https://www.tiktok.com/video/' + m2[1];
-              }
-            }
-            return '';
-          }
-        });
-        return (res && res[0] && res[0].result) || '';
-      } catch (e) {
-        // chrome.scripting 不可用：视频详情/图集 URL 已在上方提前返回；
-        // 首页/搜索等页面取不到视口视频就一律不自动解析，避免空白页被白解析
-        return '';
-      }
-    }
     return '';
   }
 

@@ -3,11 +3,11 @@
 
 let lastParsedVideoId = null;
 let observer = null;
-let isEnabled = true;
+let isEnabled = false;
 
-// 从 chrome.storage 读取开关状态
+// 从 chrome.storage 读取开关状态（默认关闭，只有用户显式打开“推荐页滑动自动解析”才收集）
 chrome.storage.local.get('recommendAutoParse', (result) => {
-  isEnabled = result.recommendAutoParse !== false; // 默认开启
+  isEnabled = result.recommendAutoParse === true;
   if (isEnabled && isAutoParsePage()) {
     initObserver();
   }
@@ -16,7 +16,7 @@ chrome.storage.local.get('recommendAutoParse', (result) => {
 // 监听开关变化
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.recommendAutoParse) {
-    isEnabled = changes.recommendAutoParse.newValue !== false;
+    isEnabled = changes.recommendAutoParse.newValue === true;
     if (isEnabled && isAutoParsePage() && !observer) {
       initObserver();
     } else if (!isEnabled && observer) {

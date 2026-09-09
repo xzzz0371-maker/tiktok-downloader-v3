@@ -12,7 +12,7 @@ const vm = require('vm');
 const TEST_URL = 'https://www.tiktok.com/@qaom9twgj8/video/7657172908623645969';
 const SEARCH_URL = 'https://www.tiktok.com/search?q=nose';
 const OTHER_URL = 'https://github.com/xzzz0371-maker/tiktok-downloader-v3';
-const VERSION = '4.4.3';
+const VERSION = '4.5.0';
 
 // ---------- mock 元素 ----------
 function makeEl(tag) {
@@ -149,7 +149,7 @@ let pass = 0, fail = 0;
 const ok = (m) => { pass++; console.log('  ✅ ' + m); };
 const bad = (m) => { fail++; console.log('  ❌ ' + m); };
 
-async function runScenario(name, tabUrl, execResult) {
+async function runScenario(name, tabUrl, execResult, expectAuto) {
   console.log('=== 场景: ' + name + ' (' + tabUrl.slice(0, 60) + ') ===');
   CURRENT_TAB_URL = tabUrl;
   EXEC_RESULT = execResult || TEST_URL;
@@ -184,9 +184,9 @@ async function runScenario(name, tabUrl, execResult) {
   const input = els.urlInput.value;
   const startMsg = sentMessages.find(m => m && m.type === 'start-parse');
 
-  if (tabUrl.includes('tiktok.com')) {
-    const expectUrl = tabUrl.startsWith('https://www.tiktok.com/@') && tabUrl.includes('/video/')
-      ? tabUrl : (execResult || TEST_URL);
+  if (expectAuto) {
+    // 打开的具体视频页：自动填入并提交解析
+    const expectUrl = (execResult || tabUrl || TEST_URL);
     if (input === expectUrl) ok('输入框自动填入链接: ' + input.slice(0, 60));
     else bad('输入框未填入链接，当前值: "' + input + '"');
     if (startMsg && startMsg.urls && startMsg.urls.includes(expectUrl)) ok('已提交 start-parse（含链接）');
@@ -194,14 +194,11 @@ async function runScenario(name, tabUrl, execResult) {
     if (els.urlInput.value === expectUrl) ok('提交后链接保留（未被清空）');
     else bad('提交后链接被清空: "' + els.urlInput.value + '"');
   } else {
-    // 非 TikTok 页：不解析、不提交、显示诊断
-    if (input === '') ok('非TikTok页不填入链接');
-    else bad('非TikTok页误填入链接: "' + input + '"');
-    if (!startMsg) ok('非TikTok页不提交解析');
-    else bad('非TikTok页误提交: ' + JSON.stringify(sentMessages));
-    const sub = els.videoList.querySelector('.empty-sub');
-    if (sub && sub.textContent && sub.textContent.startsWith('检测到:')) ok('诊断显示检测到的标签页');
-    else bad('诊断未显示，empty-sub: "' + (sub && sub.textContent) + '"');
+    // 整页（搜索/首页等）或非 TikTok 页：不自动填入、不提交解析
+    if (input === '') ok('未自动填入链接');
+    else bad('误自动填入链接: "' + input + '"');
+    if (!startMsg) ok('未提交解析');
+    else bad('误提交解析: ' + JSON.stringify(sentMessages));
   }
 
   if (els.versionTag.textContent === 'v' + VERSION) ok('版本号显示 v' + VERSION);
@@ -210,9 +207,9 @@ async function runScenario(name, tabUrl, execResult) {
 }
 
 (async () => {
-  await runScenario('A. 视频页（直接匹配 URL）', TEST_URL);
-  await runScenario('B. 搜索页（executeScript 提取）', SEARCH_URL, TEST_URL);
-  await runScenario('C. 非 TikTok 页（不解析+诊断）', OTHER_URL, null);
+  await runScenario('A. 打开视频页（自动解析当前视频）', TEST_URL, TEST_URL, true);
+  await runScenario('B. 搜索页/整页（不再自动批量解析）', SEARCH_URL, TEST_URL, false);
+  await runScenario('C. 非 TikTok 页（不解析）', OTHER_URL, null, false);
   console.log('========== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ==========');
   process.exit(fail > 0 ? 1 : 0);
 })();

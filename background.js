@@ -1171,14 +1171,10 @@ async function parseVideo(url, opts = {}) {
   const availableApis = getApiList(encoded).filter(api => !isApiInCooldown(api.url));
   const timeoutOf = (ms, msg) => new Promise((_, reject) => setTimeout(() => reject(new Error(msg)), ms));
   // 收尾：统一 originalUrl/id，并触发语言/评论异步补充。
-  // 速度优先 + 强制无水印：视频结果如果只拿到“明显带水印”的地址，按失败处理，
-  // 绝不把带水印的当成成功结果返回。
+  // 解析阶段不强制无水印：第一阶段扒到什么（含高清带水印）就用什么，速度优先；
+  // “要无水印”在下载侧通过候选排序来满足（无水印优先，带水印作为降级保底）
   const finalize = (r) => {
     if (!r || !r.success) throw new Error('parse fail');
-    const urls = [r.hdVideoUrl, r.videoUrl].filter(Boolean);
-    const isAlbum = (r.type === 'photo') || ((r.images && r.images.length) && urls.length === 0);
-    const hasCleanUrl = urls.some(u => !looksWatermarked(u));
-    if (!isAlbum && !hasCleanUrl) throw new Error('仅获取到带水印地址，已丢弃');
     r.originalUrl = finalUrl;
     r.id = r.id == null || r.id === '' ? String(Date.now()) : String(r.id);
     enrichVideoAsync(r);
@@ -1229,7 +1225,7 @@ async function parseVideo(url, opts = {}) {
     console.log('[解析] 原画质兜底也未命中:', e.message);
   }
 
-  return { success: false, originalUrl: finalUrl, error: '未能获取到无水印资源' };
+  return { success: false, originalUrl: finalUrl, error: '所有解析源均失败' };
 }
 
 function extractVideoIdFromUrl(url) {
@@ -1846,11 +1842,10 @@ async function downloadSingleVideo(video, language = '') {
     }
   }
 
-  // 2) 候选地址去重排序：新签名 → 缓存高清 → 备用地址 → 解析源普通地址。
-  //    D：m3u8(HLS) 无法被浏览器直接存成可用 mp4，剔除，避免下到一堆没用的分片清单。
-  //    速度优先+强制无水印：URL 明显带水印(playwm/watermark=1/…)的一律不入候选。
+  // 2) 候选地址去重排序：无水印 → 高清/带水印(最后保底)。
+  //    D：m3u8(HLS) 无法被浏览器直接存成可用 mp4，剔除。
   const hlsCandidates = [];
-  const wmCandidates = []; // 带水印地址：默认不用；原画质失败满 3 次(allowFallback)才追加为最后保底
+  const wmCandidates = []; // 带水印地址：先不优先；无水印候选缺失或失败满 3 次时才追加
   const candidates = [];
   const pushCand = (u) => {
     u = (u || '').trim();
@@ -1863,8 +1858,13 @@ async function downloadSingleVideo(video, language = '') {
   pushCand(url);
   pushCand(freshAltUrl);
   pushCand(video.videoUrl);
-  // 原画质已失败满 3 次 → 允许把带水印(高清)地址追加为降级候选，保证能下下来
-  if (allowFallback && wmCandidates.length) {
+  // 情况1：只有带水印地址（解析源没给无水印）→ 解析已不强制无水印，直接用它，别卡死下载
+  if (!candidates.length && wmCandidates.length) {
+    console.log('[下载] 无无水印候选，使用带水印(高清)地址');
+    candidates.push(...wmCandidates);
+  }
+  // 情况2：有无水印候选但原画质失败满 3 次 → 追加带水印作为降级保底
+  else if (allowFallback && wmCandidates.length) {
     console.log('[下载] 原画质失败≥3次，追加降级候选（高清/带水印）');
     candidates.push(...wmCandidates);
   }
@@ -1872,9 +1872,7 @@ async function downloadSingleVideo(video, language = '') {
     if (isOrigQuality) recordOrigFail();
     return hlsCandidates.length
       ? { success: false, error: '该视频仅有 HLS(m3u8) 流，无法直接保存为 mp4', url: null }
-      : wmCandidates.length
-        ? { success: false, error: '原画质暂不可用（失败未满 3 次，尚未降级）', url: null }
-        : { success: false, error: '无视频链接', url: null };
+      : { success: false, error: '无视频链接', url: null };
   }
 
   // 3) 直连逐个尝试 —— C：只对“直连白名单 CDN”试直连；名单外的（Akamai 等校验严格）
