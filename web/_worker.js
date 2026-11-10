@@ -6,11 +6,20 @@
 //   - 其余路径                                  回退到静态资源（index.html 等）
 // 安全：token 鉴权 + IP 限流 + 代理域名白名单，防止被当开放代理/免费解析滥用。
 
+// 代理目标域名白名单：只保留「确实会出现视频/图片流」的 CDN。
+// 注意不要再往里加与媒体流无关的通用静态资源域（例如 gstatic.com），
+// 那会让本代理变成面向该域名的免费中转。
 const ALLOWED = [
   'tiktokcdn.com', 'tiktokcdn-us.com', 'tiktokcdn-cn.com', 'tiktokcdn-eu.com', 'tiktokcdn-in.com',
-  'tiktokv.com', 'webapp-prime.tiktok.com',
-  'douyinvod.com', 'zjcdn.com', 'douyin.com', 'iesdouyin.com',
-  'amemv.com', 'bytecdn.cn', 'volccdn.com', 'byteimg.com', 'gstatic.com'
+  // tiktokv 有多个区域 TLD：实测页面出现过 *.tiktokv.eu，ssstik 解出的地址是 *.tiktokv.us，
+  // 只写 tiktokv.com 会让这些正常播放地址在代理侧被判「domain not allowed」。
+  'tiktokv.com', 'tiktokv.eu', 'tiktokv.us', 'webapp-prime.tiktok.com',
+  // ssstik 端口返回的直链走它自己的代理域，需放行才能下载
+  'tikcdn.io',
+  // tikdownloader/tikvid 端口返回的直链走 snapcdn 的 JWT 代理
+  'snapcdn.app',
+  'douyinvod.com', 'zjcdn.com', 'douyin.com', 'iesdouyin.com', 'douyinpic.com', 'douyinstatic.com',
+  'amemv.com', 'bytecdn.cn', 'volccdn.com', 'byteimg.com', 'muscdn.com', 'ibytedtos.com'
 ];
 
 // 防滥用 token（插件/网页版内置，接口不公开宣传）
@@ -61,6 +70,8 @@ function checkToken(url) {
 }
 
 // IP 限流：每 IP 每分钟最多 60 次
+// 注意：批量解析（几百条链接）会接近这个上限；如需放开可调这里，
+// 但下调会更容易误伤正常大批量使用。
 const ipHits = new Map();
 function rateLimited(ip) {
   const now = Date.now();
@@ -68,6 +79,19 @@ function rateLimited(ip) {
   if (arr.length >= 60) { ipHits.set(ip, arr); return true; }
   arr.push(now);
   ipHits.set(ip, arr);
+  return false;
+}
+
+// 代理限流：比解析更严格（一次代理就是一个大文件的带宽开销）
+// 单次下载只产生 1 个（长连接）请求，所以并发下载也不会接近该阈值。
+const PROXY_HITS_PER_MIN = 40;
+const proxyHits = new Map();
+function rateLimitedProxy(ip) {
+  const now = Date.now();
+  const arr = (proxyHits.get(ip) || []).filter(ts => now - ts < 60000);
+  if (arr.length >= PROXY_HITS_PER_MIN) { proxyHits.set(ip, arr); return true; }
+  arr.push(now);
+  proxyHits.set(ip, arr);
   return false;
 }
 
@@ -390,17 +414,25 @@ async function parseHtmlWithUA(finalUrl, userAgent, diag) {
 
 // TikTok cookie 缓存：先抓首页拿 tt_webid/tt_csrf_token，缓解数据中心 IP 的 playAddr 降级
 let cookieCache = { value: '', at: 0 };
+let cookieInflight = null;
 async function getTikTokCookie() {
   if (cookieCache.value && Date.now() - cookieCache.at < 10 * 60 * 1000) return cookieCache.value;
-  try {
-    const r = await fetchWithTimeout('https://www.tiktok.com/', { headers: { 'User-Agent': UA } }, 8000);
-    const all = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [];
-    const single = r.headers.get('set-cookie') || '';
-    const list = all.length ? all : (single ? [single] : []);
-    const parts = list.map(c => String(c).split(';')[0]).filter(Boolean).join('; ');
-    if (parts) { cookieCache = { value: parts, at: Date.now() }; }
-  } catch (e) {}
-  return cookieCache.value;
+  // 并发去重：一次解析会同时发起多个上游请求，若不去重，每个请求都会各自抓一次首页
+  if (cookieInflight) return cookieInflight;
+  cookieInflight = (async () => {
+    try {
+      const r = await fetchWithTimeout('https://www.tiktok.com/', { headers: { 'User-Agent': UA } }, 8000);
+      const all = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [];
+      const single = r.headers.get('set-cookie') || '';
+      const list = all.length ? all : (single ? [single] : []);
+      const parts = list.map(c => String(c).split(';')[0]).filter(Boolean).join('; ');
+      if (parts) { cookieCache = { value: parts, at: Date.now() }; }
+    } catch (e) {} finally {
+      cookieInflight = null;
+    }
+    return cookieCache.value;
+  })();
+  return cookieInflight;
 }
 
 // TikTok 官方内部 API 通用查询：item/detail 与 item/get（带 cookie，多区域并行竞速，
@@ -456,6 +488,186 @@ async function parseTiktokOfficial(itemId, apiPath, sourceName) {
 }
 async function parseViaItemDetail(itemId) { return parseTiktokOfficial(itemId, '/api/item/detail/', 'tiktok-item-detail'); }
 async function parseViaItemGet(itemId) { return parseTiktokOfficial(itemId, '/api/item/get/', 'tiktok-item-get'); }
+
+// 轻量 HTML 实体解码 + 去标签（用于第三方站点返回的标题/作者）
+function plainText(s) {
+  return String(s || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+// ============================================================
+//  ssstik.io —— 第三方站点解析（服务端自带身份池，不需要我们持有 Cookie）
+//  【2026-11-05 实测】POST https://ssstik.io/abc?url=dl 换回 tikcdn.io 直链：
+//    · 无需 API key、无需登录
+//    · 返回的无水印直链**不带 Referer 也能 200 下载**（实测 3.35MB）
+//    · 其"高清"按钮走 CF 人机挑战（/abc?url=<token> → "Just a moment"），
+//      程序化只能取标准无水印版本，故本源不承诺最高码率。
+//  【重要】该站对"视频不存在/私密"返回 **HTTP 200 + 文案**，必须看正文，
+//  否则会把失败当成功（与 api.qingdou.vip 的假活是同一类坑）。
+// ============================================================
+async function parseFromSsstik(finalUrl) {
+  const resp = await fetchWithTimeout('https://ssstik.io/abc?url=dl', {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'text/html,application/xhtml+xml,*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin': 'https://ssstik.io',
+      'Referer': 'https://ssstik.io/'
+    },
+    body: 'id=' + encodeURIComponent(finalUrl) + '&locale=en&tt=ssstik'
+  }, 12000);
+  if (!resp.ok) throw new Error('ssstik HTTP ' + resp.status);
+  const html = await resp.text();
+  if (!html || html.length < 500) throw new Error('ssstik empty response');
+
+  // 假活拦截（强化版）：
+  // 必须确认返回的是**真正的结果页**，而不是"不可用"提示页。
+  // 【2026-11-05 线上踩坑】原先只判断"页面里有没有 tikcdn 链接"，
+  // 而不可用页可能残留别处的 tikcdn 链接 → 被判成功 → 列表里出现
+  // 「无标题 / 未知作者 / 高清」的坏卡片，点下载必报 Chrome 的 SERVER_FAILED。
+  const isResultPage = /class="[^"]*without_watermark[^"]*"/.test(html)
+                    || /<p class="maintext">/.test(html);
+  if (!isResultPage) {
+    if (/currently unavailable|not reachable|removed by user|private or not/i.test(html)) {
+      throw new Error('ssstik: video unavailable');
+    }
+    throw new Error('ssstik: not a result page');
+  }
+
+  // 视频直链：排除 /ssstik/m/（MP3 音频）与 /ssstik/a/（头像），这两类都是误命中
+  const links = [...html.matchAll(/href="(https:\/\/tikcdn\.io\/ssstik\/[^"]+)"/g)]
+    .map(m => m[1])
+    .filter(u => !/\/ssstik\/(m|a)\//.test(u));
+  if (!links.length) throw new Error('ssstik: no video link');
+
+  // 直链可用性校验：ssstik 有时会给一条"生成了但取不到字节"的链接
+  // （tikcdn 返回 204 / 空体），落到下载侧就是 SERVER_FAILED。
+  // 这里用 1 字节 Range 实测一次，只有真能取到内容才采信，否则抛错让
+  // html / 静默标签页接手——宁可在解析阶段失败，也不要产出点不动的卡片。
+  let playable = '';
+  for (const u of links) {
+    try {
+      const probe = await fetchWithTimeout(u, {
+        headers: { 'User-Agent': UA, 'Referer': 'https://ssstik.io/', 'Range': 'bytes=0-0' }
+      }, 6000);
+      const ok = probe.status === 200 || probe.status === 206;
+      try { if (probe.body) probe.body.cancel(); } catch (e) {}
+      if (ok) { playable = u; break; }
+    } catch (e) { /* 换下一条 */ }
+  }
+  if (!playable) throw new Error('ssstik: link not playable');
+
+  const title = plainText((html.match(/<p class="maintext">([\s\S]*?)<\/p>/) || [])[1] || '');
+  const author = plainText((html.match(/<h2>([\s\S]*?)<\/h2>/) || [])[1] || '');
+  const vid = (finalUrl.match(/\/video\/(\d+)/) || [])[1] || String(Date.now());
+
+  return {
+    success: true,
+    id: vid,
+    title: title || '无标题',
+    author: author || '未知作者',
+    authorAvatar: '',
+    cover: '',
+    videoUrl: playable,
+    hdVideoUrl: playable,
+    images: [],
+    duration: 0,
+    likes: 0,
+    createTime: 0,
+    quality: '高清',
+    source: 'ssstik'
+  };
+}
+
+// ============================================================
+//  tikdownloader.io / tikvid.io —— 同一套后端，互为镜像
+//  【2026-11-06 实测】POST /api/ajaxSearch（表单 q=<链接>&lang=en）
+//    → {"status":"ok","data":"<结果页 HTML>"}
+//    · 连续 4 次全部成功、约 1.1s，**没有出现 ssstik 那种限流**
+//    · 同时给两档：`Download MP4`（3.2MB）与 `Download MP4 HD`（14.3MB）
+//    · 链接走它自己的 dl.snapcdn.app 代理（JWT 里带原始 CDN 地址），可直下
+//  【关键】它同时会输出**原始 CDN 地址**（v16m.tiktokcdn-us.com），
+//  但那个地址实测 403（签名绑它自己的出口），只能用 snapcdn 包装链接。
+// ============================================================
+async function parseFromTikdownloader(finalUrl) {
+  const hosts = ['https://tikdownloader.io', 'https://tikvid.io'];
+  let html = '';
+  let lastErr = null;
+  for (const host of hosts) {
+    try {
+      const resp = await fetchWithTimeout(host + '/api/ajaxSearch', {
+        method: 'POST',
+        headers: {
+          'User-Agent': UA,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept': 'application/json',
+          'Origin': host,
+          'Referer': host + '/'
+        },
+        body: 'q=' + encodeURIComponent(finalUrl) + '&lang=en'
+      }, 12000);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const j = await resp.json();
+      if (j && j.status === 'ok' && j.data && j.data.length > 200) { html = j.data; break; }
+      throw new Error('status=' + (j && j.status));
+    } catch (e) { lastErr = e; }
+  }
+  if (!html) throw new Error('tkdl: ' + ((lastErr && lastErr.message) || 'no response'));
+
+  // 只认 dl.snapcdn.app 的包装链接；原始 CDN 地址对我们是 403，不采信
+  const anchors = [...html.matchAll(/<a[^>]+href="(https:\/\/dl\.snapcdn\.app\/get\?token=[^"]+)"[^>]*>([\s\S]*?)<\/a>/g)]
+    .map(m => ({ url: m[1].replace(/&amp;/g, '&'), text: plainText(m[2]) }))
+    .filter(a => !/MP3|music/i.test(a.text));
+  if (!anchors.length) throw new Error('tkdl: no download link');
+
+  const hd = anchors.find(a => /HD/i.test(a.text));
+  const std = anchors.find(a => !/HD/i.test(a.text));
+
+  // 与 ssstik 同款护栏：链接必须实测能取到字节，否则宁可失败也不产出点不动的卡片
+  let picked = '';
+  for (const cand of [hd, std].filter(Boolean)) {
+    try {
+      const probe = await fetchWithTimeout(cand.url, {
+        headers: { 'User-Agent': UA, 'Range': 'bytes=0-0' }
+      }, 8000);
+      const ok = probe.status === 200 || probe.status === 206;
+      try { if (probe.body) probe.body.cancel(); } catch (e) {}
+      if (ok) { picked = cand.url; break; }
+    } catch (e) { /* 试下一个 */ }
+  }
+  if (!picked) throw new Error('tkdl: link not playable');
+
+  const title = plainText((html.match(/<h3>([\s\S]*?)<\/h3>/) || [])[1] || '');
+  const cover = (html.match(/<img[^>]+src="(https:\/\/[^"]*tiktokcdn[^"]+)"/) || [])[1] || '';
+  // 结果页不含作者名，从链接里的 @handle 取（比显示"未知作者"有意义）
+  const author = (finalUrl.match(/@([^/?#]+)/) || [])[1] || '';
+  const vid = (finalUrl.match(/\/video\/(\d+)/) || [])[1] || String(Date.now());
+  const isHd = !!(hd && picked === hd.url);
+
+  return {
+    success: true,
+    id: vid,
+    title: title || '无标题',
+    author: author || '未知作者',
+    authorAvatar: '',
+    cover,
+    // hdVideoUrl 只能放**已验证可用**的地址：HD 探不通时退回标准档，
+    // 不能把没验过的 hd.url 塞进去（否则又会出现点不动的卡片）。
+    videoUrl: (std && std.url) || picked,
+    hdVideoUrl: isHd ? picked : ((std && std.url) || picked),
+    images: [],
+    duration: 0,
+    likes: 0,
+    createTime: 0,
+    quality: isHd ? '高清' : '原画质',
+    source: 'tkdl'
+  };
+}
 
 // 第三方解析源（Worker 海外访问，不受国内网络限制）
 function buildApiSources(enc, itemId) {
@@ -594,7 +806,25 @@ async function parseViaSources(finalUrl, diag, mode) {
   const runPage = mode === 'all' || mode === 'html';
   const runApis = mode === 'all' || mode === 'api';
   const runItem = mode === 'all' || mode === 'item';
+  const runSsstik = mode === 'all' || mode === 'ssstik';
+  const runTkdl = mode === 'all' || mode === 'tkdl';
   const sources = [];
+
+  if (runTkdl) {
+    sources.push(parseFromTikdownloader(finalUrl).then(r => { recordSource('tkdl', true); return r; }).catch(e => {
+      recordSource('tkdl', false);
+      if (diag) errors.push('tkdl: ' + e.message);
+      throw e;
+    }));
+  }
+
+  if (runSsstik) {
+    sources.push(parseFromSsstik(finalUrl).then(r => { recordSource('ssstik', true); return r; }).catch(e => {
+      recordSource('ssstik', false);
+      if (diag) errors.push('ssstik: ' + e.message);
+      throw e;
+    }));
+  }
 
   if (runPage) {
     sources.push(parseFromPage(finalUrl, diag).then(r => { recordSource('page', true); return r; }).catch(e => {
@@ -845,6 +1075,88 @@ async function handleDiagPage(request) {
 // ============================================================
 //  视频流代理 /api/proxy
 // ============================================================
+// 只透传这几个安全响应头；不透传 Set-Cookie / hop-by-hop 头
+const SAFE_PROXY_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges',
+  'cache-control', 'content-encoding', 'etag', 'last-modified', 'expires'];
+const MAX_REDIRECT_HOPS = 5;
+
+// 上游取流重试策略。
+// 背景（实测）：TikTok CDN（Akamai）对数据中心 IP 有间歇性风控，同一个新签名地址
+// 连续请求会 206 / 502 交替出现，单次成功率约 50%。原实现「4 个 UA 各试一次就放弃」
+// 会把这种抖动直接变成客户端的 502（下载器显示"服务器错误"）。
+// 现改为「UA 轮询 × 多轮重试」，并把「200 但返回 HTML/JSON 错误页」也判为失败，
+// 避免把过期签名的错误页当成视频存成坏文件。
+const UPSTREAM_MAX_ATTEMPTS = 8;
+const UPSTREAM_RETRY_DELAY_MS = 250;
+// 这些状态码代表「链接本身不可用」，重试无意义，直接把真实状态码回给调用方
+const UPSTREAM_HARD_STOP = [400, 404, 405, 410];
+
+function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// 上游返回的内容像不像「错误页」而不是媒体流
+function looksLikeErrorPage(resp) {
+  const ct = (resp.headers.get('content-type') || '').toLowerCase();
+  return ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain');
+}
+
+// 手动跟随重定向并逐跳校验白名单。
+// fetch 的 redirect:'follow' 不会再校验目标域名——白名单域名只要存在可控跳转端点，
+// 就能把请求导向任意地址（SSRF）。返回 null 表示跳转非法/次数超限。
+async function fetchMediaChecked(target, headers, method) {
+  let current = target;
+  for (let hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
+    const resp = await fetch(current, { method: method || 'GET', headers: headers, redirect: 'manual' });
+    if ([301, 302, 303, 307, 308].indexOf(resp.status) !== -1) {
+      const loc = resp.headers.get('location');
+      if (!loc) return resp;
+      let next;
+      try { next = new URL(loc, current); } catch (e) { return null; }
+      if ((next.protocol !== 'https:' && next.protocol !== 'http:') || !hostAllowed(next.hostname)) {
+        return null;
+      }
+      current = next.href;
+      continue;
+    }
+    return resp;
+  }
+  return null; // 跳转过多
+}
+
+// 带重试的上游取流。返回：
+//   { resp }            —— 拿到可用媒体响应
+//   { blocked: true }   —— 重定向到非白名单域（安全拦截，不重试）
+//   { failed, lastStatus } —— 重试用尽仍失败
+async function fetchUpstream(target, baseHeaders, method) {
+  let lastStatus = 0;
+  let cookieRefreshed = false;
+  for (let attempt = 0; attempt < UPSTREAM_MAX_ATTEMPTS; attempt++) {
+    const headers = Object.assign({}, baseHeaders, {
+      'User-Agent': PROXY_UAS[attempt % PROXY_UAS.length],
+      'Cookie': (await getTikTokCookie()) || ''
+    });
+    try {
+      let r = await fetchMediaChecked(target, headers, method);
+      if (r === null) return { blocked: true };
+      // 403/406 通常是 cookie 失效或风控波动：强制刷新 cookie 后立即再试一次。
+      // 每个请求只做一次——否则在持续 403 的情况下会反复抓 TikTok 首页（每次多一个请求）。
+      if ((r.status === 403 || r.status === 406) && !cookieRefreshed) {
+        cookieRefreshed = true;
+        cookieCache = { value: '', at: 0 };
+        r = await fetchMediaChecked(target,
+          Object.assign({}, headers, { 'Cookie': (await getTikTokCookie()) || '' }), method);
+        if (r === null) return { blocked: true };
+      }
+      if ((r.ok || r.status === 206) && !looksLikeErrorPage(r)) return { resp: r };
+      lastStatus = r.status;
+      if (UPSTREAM_HARD_STOP.indexOf(r.status) !== -1) return { resp: r };
+    } catch (e) {
+      if (!lastStatus) lastStatus = -1; // -1 = 网络层异常（连接被重置等）
+    }
+    if (attempt < UPSTREAM_MAX_ATTEMPTS - 1) await sleepMs(UPSTREAM_RETRY_DELAY_MS);
+  }
+  return { failed: true, lastStatus: lastStatus };
+}
+
 async function handleProxy(request) {
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -853,6 +1165,15 @@ async function handleProxy(request) {
     return jsonResponse({ error: 'method not allowed' }, 405, corsHeaders());
   }
   const url = new URL(request.url);
+  // 鉴权 + 限流：代理消耗的是出站带宽，必须与 /api/parse 同级保护。
+  // 缺了这两道，任何人都能把它当免费的 CORS 中转直接刷爆账号配额。
+  if (!checkToken(url)) {
+    return jsonResponse({ error: 'invalid token' }, 401, corsHeaders());
+  }
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  if (rateLimitedProxy(ip)) {
+    return jsonResponse({ error: 'rate limited' }, 429, corsHeaders());
+  }
   const target = url.searchParams.get('url');
   if (!target) {
     return jsonResponse({ error: 'missing url param' }, 400, corsHeaders());
@@ -865,41 +1186,90 @@ async function handleProxy(request) {
     return jsonResponse({ error: 'domain not allowed' }, 403, corsHeaders());
   }
   try {
-    let upstream = null;
-    // UA 轮询 + cookie 刷新：TikTok CDN 对数据中心 IP/UA 特征风控，逐个组合尝试
-    for (let i = 0; i < PROXY_UAS.length && !upstream; i++) {
-      let ck = await getTikTokCookie();
-      const fetchUp = async (ckv) => {
-        return fetch(t.href, {
-          headers: {
-            'User-Agent': PROXY_UAS[i],
-            'Referer': 'https://www.tiktok.com/',
-            'Accept': 'video/mp4, video/*;q=0.9, */*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cookie': ckv || '',
-            'Range': request.headers.get('Range') || ''
-          },
-          redirect: 'follow'
-        });
-      };
-      let r = await fetchUp(ck);
-      // 403/406（cookie 失效或风控波动）：强制刷新 cookie 重试一次
-      if (r.status === 403 || r.status === 406) {
-        cookieCache = { value: '', at: 0 };
-        ck = await getTikTokCookie();
-        r = await fetchUp(ck);
-      }
-      if (r.ok || r.status === 206) upstream = r;
+    const baseHeaders = {
+      'Referer': 'https://www.tiktok.com/',
+      'Accept': 'video/mp4, video/*;q=0.9, */*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9'
+    };
+    // 只在客户端确实带了 Range 时才转发：原实现无条件设置 'Range': '' 会发出
+    // 一个非法的空 Range 头
+    const clientRange = request.headers.get('Range');
+    if (clientRange) baseHeaders['Range'] = clientRange;
+
+    const up = await fetchUpstream(t.href, baseHeaders, request.method);
+    if (up.blocked) {
+      return jsonResponse({ error: 'redirect to non-allowlisted domain blocked' }, 403, corsHeaders());
     }
-    const headers = new Headers(upstream.headers);
-    headers.set('Access-Control-Allow-Origin', '*');
-    headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    headers.set('Access-Control-Allow-Headers', '*');
-    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Disposition');
+    if (!up.resp) {
+      // 带上 lastStatus / attempts，便于在插件侧日志里直接定位是 CDN 风控还是网络问题
+      return jsonResponse({
+        error: 'upstream failed', lastStatus: up.lastStatus, attempts: UPSTREAM_MAX_ATTEMPTS
+      }, 502, corsHeaders());
+    }
+    const headers = new Headers(corsHeaders());
+    for (const name of SAFE_PROXY_HEADERS) {
+      const value = up.resp.headers.get(name);
+      if (value) headers.set(name, value);
+    }
     headers.set('Content-Disposition', 'attachment; filename="tiktok-download.mp4"');
-    return new Response(upstream.body, { status: upstream.status, headers: headers });
+    // HEAD 请求不回 body（保持 HEAD 语义，也让插件的候选探测更轻）
+    const body = request.method === 'HEAD' ? null : up.resp.body;
+    return new Response(body, { status: up.resp.status, headers: headers });
   } catch (e) {
     return jsonResponse({ error: 'proxy fetch failed' }, 502, corsHeaders());
+  }
+}
+
+// ============================================================
+//  元数据端点 /api/meta
+//  【2026-11-05 实测】TikTok 官方 oEmbed 仍在，但**字段已被裁剪**——
+//  对主流视频只返回 version/type/width/height/html/embed_*，
+//  `title` / `author_name` / `thumbnail_url` 全部缺失，
+//  所以"只用 oEmbed"这个端点是没有价值的（页面也没有 og:title 可抓）。
+//  现策略：先试 oEmbed（便宜、官方），拿不到再用 ssstik 结果页兜底。
+//  本端点**只给元数据，不含播放地址**，不能当解析源用。
+// ============================================================
+async function handleMeta(request) {
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders() });
+  const url = new URL(request.url);
+  if (!checkToken(url)) return jsonResponse({ error: 'invalid token' }, 401, corsHeaders());
+  const raw = url.searchParams.get('url');
+  if (!raw) return jsonResponse({ error: 'missing url' }, 400, corsHeaders());
+  const target = normalizeUrl(raw);
+  const id = extractVideoId(target) || '';
+  try {
+    let title = '', author = '', cover = '', via = '';
+
+    // ① 官方 oEmbed 优先（最便宜，但它会裁剪字段）
+    try {
+      const resp = await fetchWithTimeout(
+        'https://www.tiktok.com/oembed?url=' + encodeURIComponent(target),
+        { headers: { 'User-Agent': UA, 'Accept': 'application/json' } }, 6000);
+      if (resp.ok) {
+        const d = await resp.json();
+        title = plainText(d.title || '');
+        author = plainText(d.author_name || '');
+        cover = d.thumbnail_url || '';
+        if (title || author) via = 'oembed';
+      }
+    } catch (e) { /* 走下面的兜底 */ }
+
+    // ② 兜底：ssstik 结果页带标题/作者。
+    // 背景（2026-11-05 实测）：TikTok 已把 oEmbed 裁到只剩 embed 信息，
+    // 主流视频的 title/author_name/thumbnail_url 全是空，光靠官方接口这个端点没有价值。
+    if (!title && !author) {
+      const p = await parseFromSsstik(target);
+      title = p.title || '';
+      author = p.author || '';
+      via = 'ssstik';
+    }
+
+    if (!title && !author) throw new Error('no metadata');
+    return jsonResponse({
+      success: true, id, title, author, cover, source: via
+    }, 200, corsHeaders());
+  } catch (e) {
+    return jsonResponse({ success: false, error: e.message || 'meta failed' }, 200, corsHeaders());
   }
 }
 
@@ -908,6 +1278,9 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/api/parse' || url.pathname.startsWith('/api/parse')) {
       return handleParse(request);
+    }
+    if (url.pathname === '/api/meta' || url.pathname.startsWith('/api/meta')) {
+      return handleMeta(request);
     }
     if (url.pathname === '/api/diag-page' || url.pathname.startsWith('/api/diag-page')) {
       return handleDiagPage(request);

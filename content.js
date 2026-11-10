@@ -31,6 +31,9 @@ function isAutoParsePage() {
   const host = location.hostname;
   if (!host.includes('tiktok.com') && !host.includes('douyin.com')) return false;
   const path = location.pathname;
+  // 详情类页面（视频/图集）由 popup.js 的自动解析链路负责，这里必须排除：
+  // 两边都提交会让同一视频被解析两次（URL 构造方式不同，后台去重键命不中）
+  if (/\/(?:video|photo|slideshow|note|v)\/\d+/.test(path)) return false;
   // TikTok：推荐页（/、/foryou、区域页）+ 搜索页 + 标签页 + 用户主页
   if (host.includes('tiktok.com')) {
     return /^\/(?:[a-z]{2}\/)?(?:foryou)?$/.test(path)
@@ -112,14 +115,16 @@ function getCurrentVideoInfo() {
   return { videoId, author };
 }
 
-// DOM 变动回调
+// DOM 变动回调（真正的检测逻辑，已由 scheduleMutate 防抖后再调用）
 function onDomMutate() {
   if (!isEnabled || !isAutoParsePage()) return;
+  // 后台标签页不做检测：全文档查询在不可见时纯属浪费
+  if (document.visibilityState !== 'visible') return;
   const info = getCurrentVideoInfo();
   if (!info?.videoId) return;
   if (info.videoId === lastParsedVideoId) return;
   lastParsedVideoId = info.videoId;
-  
+
   // 通知后台，提交解析任务
   try {
     chrome.runtime.sendMessage({
@@ -127,24 +132,42 @@ function onDomMutate() {
       videoId: info.videoId,
       author: info.author,
       pageUrl: location.href
+    }, () => {
+      // 必须读取：SW 休眠/扩展重载时会产生 lastError，不读会打印
+      // "Unchecked runtime.lastError" 警告
+      void chrome.runtime.lastError;
     });
   } catch (e) {
     // SW 可能休眠，忽略错误
   }
 }
 
+// 防抖调度：TikTok 推荐页 DOM 每秒可变动数百次，而 getCurrentVideoInfo 会做
+// 全文档 querySelectorAll + getBoundingClientRect（强制同步布局/回流）。
+// 每次变动都直接执行会造成明显掉帧，这里统一合并到一次。
+const MUTATE_DEBOUNCE_MS = 400;
+let mutateTimer = null;
+function scheduleMutate() {
+  if (mutateTimer !== null) return;
+  mutateTimer = setTimeout(() => {
+    mutateTimer = null;
+    try { onDomMutate(); } catch (e) {}
+  }, MUTATE_DEBOUNCE_MS);
+}
+
 // 启动 MutationObserver
 function initObserver() {
   if (observer) return;
-  observer = new MutationObserver(onDomMutate);
+  if (!document.body) return; // document_idle 下通常已就绪，缺失则跳过
+  observer = new MutationObserver(scheduleMutate);
   observer.observe(document.body, {
     childList: true,
     subtree: true,
     attributes: false
   });
-  
+
   // 启动时立即检测一次
-  onDomMutate();
+  try { onDomMutate(); } catch (e) {}
 }
 
 // 页面卸载时清理
@@ -153,7 +176,10 @@ window.addEventListener('beforeunload', () => {
     observer.disconnect();
     observer = null;
   }
-
+  if (mutateTimer !== null) {
+    clearTimeout(mutateTimer);
+    mutateTimer = null;
+  }
 });
 
 // 监听来自 popup 的消息（比如立即检测当前视频）

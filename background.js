@@ -6,7 +6,7 @@
 // 说明：不再以 ES module 方式 import（去掉 manifest 的 type=module），
 // 两个格式化小函数直接内联，保证在 Firefox / 部分老内核浏览器也能加载 SW。
 
-// ---------- 点赞数格式化（与 common.js 保持一致） ----------
+// ---------- 点赞数格式化 ----------
 function formatLikes(n) {
   if (!n || n <= 0) return '';
   if (n < 1000) return String(n);
@@ -15,7 +15,7 @@ function formatLikes(n) {
   return (n / 100000000).toFixed(1).replace(/\.0$/, '') + '亿';
 }
 
-// ---------- 日期格式化（与 common.js 保持一致） ----------
+// ---------- 日期格式化 ----------
 function formatDate(ts) {
   if (!ts) return '';
   const date = new Date(ts < 1e12 ? ts * 1000 : ts);
@@ -27,18 +27,23 @@ function formatDate(ts) {
 
 const API_TIMEOUT = 10000;
 // 解析两段式窗口（速度优先 + 高清无水印优先）：
-// 第一段先跑“高清无水印快源”(第三方 API + 自建 api 池)最多 2 秒；
-// 拿不到再跑“原画质/无水印慢通道”(页面/官方 item/本地拦截)最多 4 秒
-const PARSE_FAST_HD_MS = 2000;
+// 第一段先跑“高清无水印快源”(第三方 API + 自建 api 池)最多 5 秒（单源上限同此窗口）；
+// 拿不到再跑“本地通道”(拦截缓存 / 页面深挖 / FetchHTML)最多 4 秒——走浏览器自身出口，
+// 不受服务端数据中心 IP 风控影响。
+const PARSE_FAST_HD_MS = 5000;
 const PARSE_ORIG_MS = 4000;
 // 下载候选“首次无进展”判定：30 秒内没有任何字节进展才取消该候选，随后继续下一候选/重试。
 // 只要下载一直在走字节，观察会不断顺延（见 runDownload 的 checkTimeout），不会误杀大文件。
 const FIRST_STALL_CHECK_MS = 30000;
+// 单个候选走代理时的下载尝试次数：CDN 风控是间歇性的（实测同一签名约 50% 波动），
+// 一次失败就换候选会浪费掉本来能成功的候选。每次尝试失败后退避重试。
+const PROXY_DL_ATTEMPTS = 3;
 // 自建解析后端（Cloudflare Pages 同域部署，国内可达；海外边缘多源轮询 + 页面直抓）
 const OWN_PARSE_API = 'https://tiktok-downloader-av8.pages.dev/api/parse';
 const OWN_PARSE_TOKEN = 'tdp2026x7kq9mz3vn8clw4r';
 // 自建下载代理（服务器带 Cookie+Referer 拉流，直连被拒时的兜底通道）
-const OWN_PROXY_API = 'https://tiktok-downloader-av8.pages.dev/api/proxy?url=';
+// 必须带 token：后端 /api/proxy 已改为「鉴权 + IP 限流」，裸调用会被 401 拒绝。
+const OWN_PROXY_API = 'https://tiktok-downloader-av8.pages.dev/api/proxy?token=' + OWN_PARSE_TOKEN + '&url=';
 
 // 全局错误捕获：后台脚本在个别浏览器（如豆包）可能因某个 API 缺失/受限而在
 // 启动阶段抛错导致“手动解析/自动解析全部无响应”，这里把错误打印到 SW 控制台便于排查
@@ -54,6 +59,13 @@ try {
 // ---------- 工具函数 ----------
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// 高频诊断日志开关：
+// 只用于「网络拦截回调」——它会对页面加载的每一个媒体请求触发，长时间使用时
+// 能刷出成百上千行。默认关闭；排查"拦截没抓到地址"时改为 true 即可。
+// 注意：下载链路的日志属于低频且排查必需，不受本开关影响，始终输出。
+const VERBOSE_LOG = false;
+const vlog = (...args) => { if (VERBOSE_LOG) console.log(...args); };
+
 // 自动关闭的通知（默认 8 秒后自动清除，避免一直留在屏幕上）
 function showNotification(options, autoCloseMs = 8000) {
   chrome.notifications.create(options, (id) => {
@@ -63,11 +75,18 @@ function showNotification(options, autoCloseMs = 8000) {
   });
 }
 
-async function fetchWithTimeout(url, options = {}, timeout = API_TIMEOUT) {
+// externalSignal：外部取消信号（用于「竞速命中后立刻取消其余落败请求」，
+// 避免它们继续占满带宽与第三方配额）。与本函数自带的超时 controller 叠加生效。
+async function fetchWithTimeout(url, options = {}, timeout = API_TIMEOUT, externalSignal = null) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener('abort', onExternalAbort);
+  }
   try {
-    const response = await fetch(url, {
+    return await fetch(url, {
       ...options,
       signal: controller.signal,
       headers: {
@@ -75,12 +94,15 @@ async function fetchWithTimeout(url, options = {}, timeout = API_TIMEOUT) {
         ...(options.headers || {})
       }
     });
-    clearTimeout(timeoutId);
-    return response;
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') throw new Error('请求超时');
+    if (error.name === 'AbortError') {
+      // 区分「窗口超时」与「竞速命中后主动取消」：后者不是故障，不应报成超时
+      throw new Error(externalSignal && externalSignal.aborted ? '请求已取消' : '请求超时');
+    }
     throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
   }
 }
 
@@ -89,10 +111,25 @@ async function fetchWithTimeout(url, options = {}, timeout = API_TIMEOUT) {
 // ============================================================
 const capturedVideoUrls = new Map(); // tabId -> { videoUrl, hdVideoUrl, capturedAt }
 
-const CDN_DOMAINS = ['tiktokcdn', 'douyinvod', 'douyinpic', 'douyinstatic', 'bytecdntp'];
+// 已知的媒体 CDN 主机片段。**这只是兜底，不是判定的必要条件**——
+// TikTok 的 CDN 主机按区域/边缘轮换（`*-webapp-prime.tiktok.com`（Akamai）、
+// `*.tiktokv.com`、`*.tiktokv.eu`、`*.muscdn.com`、`*.tiktokcdn.com` ...），
+// 白名单一旦漏项，拦截器会把媒体请求**静默丢弃**，静默标签页必然超时，
+// 表现就是"解析不出来"。2026-11-05 即因此修复：原清单只有 tiktokcdn/douyin*，
+// 漏掉 prime/tiktokv/muscdn，而这些恰恰是实际播放地址所在。
+const CDN_DOMAINS = [
+  'tiktokcdn', 'tiktokv.', 'muscdn', 'webapp-prime.tiktok.com',
+  'douyinvod', 'douyinpic', 'douyinstatic', 'bytecdntp', 'bytecdn',
+  'amemv', 'zjcdn', 'ibytedtos'
+];
 
-function isVideoCdnUrl(url) {
-  return CDN_DOMAINS.some(d => url.includes(d)) && /\.(mp4|m3u8|webm)(\?|$)/i.test(url);
+// 判定是否「视频媒体请求」。
+// 首要依据是浏览器给的资源类型（type==='media'），**不看主机名**；
+// 主机白名单仅用于 type 不可靠时的兜底，避免再次因 CDN 换域名而全面失效。
+function isVideoCdnUrl(url, type) {
+  if (!/\.(mp4|m3u8|webm)(\?|$)/i.test(url || '')) return false;
+  if (type === 'media') return true;
+  return CDN_DOMAINS.some(d => url.includes(d));
 }
 
 // 节流写入 storage.session：最多每 1 秒写一次，避免频繁 IO
@@ -127,7 +164,7 @@ function saveCapturedToSession() {
 chrome.webRequest.onResponseStarted.addListener(
   (details) => {
     const { tabId, url, type } = details;
-    if (tabId < 0 || !isVideoCdnUrl(url)) return;
+    if (tabId < 0 || !isVideoCdnUrl(url, type)) return;
 
     const existing = capturedVideoUrls.get(tabId) || {};
     // media 类型或 URL 含 hdplay/watermark=0 通常是无水印高清
@@ -139,7 +176,7 @@ chrome.webRequest.onResponseStarted.addListener(
     capturedVideoUrls.set(tabId, existing);
     saveCapturedToSession();
 
-    console.log(`[拦截] tab=${tabId} type=${type} hd=${isHd}`);
+    vlog(`[拦截] tab=${tabId} type=${type} hd=${isHd}`);
   },
   { urls: ['<all_urls>'] },
   ['responseHeaders']
@@ -162,16 +199,19 @@ async function preCaptureFromTab(tabId) {
         try {
           const entries = performance.getEntriesByType('resource');
           for (const e of entries) {
-            const isCdn = e.name.includes('tiktokcdn') || e.name.includes('tiktokv')
+            if (!e.name || /^(blob|data|mediasource):/i.test(e.name)) continue;
+            // 媒体扩展名 / initiatorType=video 本身就是充分证据，**不再要求主机在白名单内**：
+            // TikTok 的媒体 CDN 按区域轮换（*-webapp-prime.tiktok.com、*.tiktokv.eu、
+            // *.muscdn.com ...），白名单漏项会让这里整段失效。
+            const isMedia = /\.(mp4|m3u8|webm|flv)(\?|$)/i.test(e.name) || e.initiatorType === 'video';
+            const isCdnNoExt = (e.name.includes('tiktokcdn') || e.name.includes('tiktokv')
                        || e.name.includes('douyinvod') || e.name.includes('douyinpic')
                        || e.name.includes('bytecdntp') || e.name.includes('bytecdn')
                        || e.name.includes('amemv.com') || e.name.includes('douyin.com')
-                       || e.name.includes('muscdn') || e.name.includes('ibytedtos');
-            const isVideo = /\.(mp4|m3u8|webm|flv)(\?|$)/i.test(e.name)
-                         || e.initiatorType === 'video'
-                         || e.name.includes('video_id') || e.name.includes('play_addr')
-                         || e.name.includes('/video/') || e.name.includes('playwm');
-            if (isCdn && isVideo) urls.push(e.name);
+                       || e.name.includes('muscdn') || e.name.includes('ibytedtos'))
+                       && (e.name.includes('video_id') || e.name.includes('play_addr')
+                           || e.name.includes('/video/') || e.name.includes('playwm'));
+            if (isMedia || isCdnNoExt) urls.push(e.name);
           }
         } catch (e) {}
         // 从 video 标签抓（包括 src、data-src、poster 等属性）
@@ -233,12 +273,23 @@ async function preCaptureFromTab(tabId) {
 // ============================================================
 //  模块二：页面深度解析（6 个数据源）
 // ============================================================
-async function parseViaPageDeep(finalUrl) {
-  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (!tabs?.[0]?.id) throw new Error('no tab');
-
-  const tabUrl = tabs[0].url || '';
-  // 放宽检查：当前标签页必须是 TikTok/抖音域名
+// explicitTabId：显式指定要深挖的标签页。静默标签页通道必须用它——那种标签页是
+// active:false 的后台页，如果仍去取「当前激活标签页」，会读到用户正在看的另一个页面
+// （或被 videoId 校验挡下而永远失败）。不传则维持原行为：取当前激活标签页。
+async function parseViaPageDeep(finalUrl, explicitTabId = null) {
+  let targetTabId = explicitTabId;
+  let tabUrl = '';
+  if (targetTabId) {
+    const info = await chrome.tabs.get(targetTabId).catch(() => null);
+    if (!info) throw new Error('tab not found');
+    tabUrl = info.url || '';
+  } else {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tabs?.[0]?.id) throw new Error('no tab');
+    targetTabId = tabs[0].id;
+    tabUrl = tabs[0].url || '';
+  }
+  // 放宽检查：目标标签页必须是 TikTok/抖音域名
   const isTiktokOrDouyin = /tiktok\.com|douyin\.com/i.test(tabUrl);
   if (!isTiktokOrDouyin) throw new Error('tab not tiktok/douyin');
 
@@ -250,13 +301,14 @@ async function parseViaPageDeep(finalUrl) {
   const urlId = getVideoId(finalUrl);
   const tabId = getVideoId(tabUrl);
 
-  // 如果两边都有 videoId，要求一致；如果只有一边有，也允许注入
-  if (urlId && tabId && urlId !== tabId) throw new Error('tab mismatch');
+  // 与拦截路径同一规则：请求带了具体 videoId 时，标签页必须指向同一视频，
+  // 否则会从「另一个视频」的页面数据里提取地址（推荐页/用户主页尤其明显）。
+  if (urlId && urlId !== tabId) throw new Error('tab mismatch');
 
   let injectTimeoutId;
   const result = await Promise.race([
     chrome.scripting.executeScript({
-      target: { tabId: tabs[0].id },
+      target: { tabId: targetTabId },
       func: () => {
         const found = [];
 
@@ -387,16 +439,19 @@ async function parseViaPageDeep(finalUrl) {
           }
         } catch (e) {}
 
-        // 数据源 5: performance API（放宽后缀限制，只要是 CDN 域名的媒体请求）
+        // 数据源 5: performance API
+        // 媒体扩展名 / initiatorType=video / contentType=video 即为充分证据，
+        // **不再要求主机在白名单内**——CDN 会按区域轮换，白名单漏项会让本数据源整段失效。
         try {
           const entries = performance.getEntriesByType('resource')
             .filter(e => {
-              const isCdn = e.name.includes('tiktokcdn') || e.name.includes('douyinvod')
-                         || e.name.includes('douyinpic') || e.name.includes('bytecdntp')
-                         || e.name.includes('bytecdn');
+              if (!e.name || /^(blob|data|mediasource):/i.test(e.name)) return false;
               const isVideo = /\.(mp4|m3u8|webm)(\?|$)/i.test(e.name)
                            || e.initiatorType === 'video' || e.contentType?.includes('video');
-              return isCdn && isVideo;
+              if (!isVideo) return false;
+              // 排除纯音频、以及明显的静态资源域名
+              if (/\.(mp3|m4a|aac)(\?|$)/i.test(e.name)) return false;
+              return true;
             });
           if (entries.length > 0) {
             entries.sort((a, b) => (b.transferSize || b.encodedBodySize || b.duration || 0)
@@ -464,7 +519,11 @@ async function parseViaPageDeep(finalUrl) {
   for (const item of found) {
     const info = await extractVideoInfo(item.data, finalUrl);
     if (info?.success) {
-      info.quality = item.source === 'universal' || item.source === 'sigi' ? '原画质' : '高清';
+      // 与 parseViaFetchHtml 同一口径：质量以实际取到的地址为准，只有判不出来时才
+      // 退回按来源估计。原实现无条件按来源覆写，而 universal/sigi 优先级最高、
+      // 页面又必然含这些数据块 → 几乎所有结果都被误标「原画质」（2026-09-17 排查）。
+      info.quality = info.quality
+        || (item.source === 'universal' || item.source === 'sigi' ? '原画质' : '高清');
       info._parseSource = item.source;
       // 补充页面元数据
       if (!info.title || info.title === '无标题') info.title = meta.title || info.title;
@@ -480,7 +539,7 @@ async function parseViaPageDeep(finalUrl) {
 // ============================================================
 //  模块二点五：Fetch HTML 解析（粘贴链接时也能不走 API）
 // ============================================================
-async function parseViaFetchHtml(finalUrl) {
+async function parseViaFetchHtml(finalUrl, signal = null) {
   // 只处理 TikTok/抖音的标准视频链接，短链接已经在前面展开了
   if (!/tiktok\.com|douyin\.com/i.test(finalUrl)) throw new Error('not tiktok/douyin url');
 
@@ -492,7 +551,7 @@ async function parseViaFetchHtml(finalUrl) {
         'Accept': 'text/html,application/xhtml+xml',
         'Accept-Language': 'en-US,en;q=0.9',
       }
-    }, 6000);
+    }, 6000, signal);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     html = await resp.text();
   } catch (e) {
@@ -585,7 +644,14 @@ async function parseViaFetchHtml(finalUrl) {
   for (const item of found) {
     const info = await extractVideoInfo(item.data, finalUrl);
     if (info?.success) {
-      info.quality = item.source === 'fetch_universal' || item.source === 'fetch_sigi' ? '原画质' : '高清';
+      // 质量以「实际取到的地址」为准（extractVideoInfo 已判定），
+      // 只有它没判出来时才退回按数据来源估计：
+      //   __UNIVERSAL_DATA__/SIGI_STATE 里的 playAddr 属于原画质页内地址；
+      //   __NEXT_DATA__ / 正则兜底命中的通常是 bitrate/下载地址，按高清算。
+      // 原实现是无条件按来源覆写，导致页面必然含 __UNIVERSAL_DATA__ →
+      // 几乎所有视频都被误标「原画质」（2026-09-17 排查确认）。
+      info.quality = info.quality
+        || (item.source === 'fetch_universal' || item.source === 'fetch_sigi' ? '原画质' : '高清');
       info._parseSource = item.source;
       if (!info.title || info.title === '无标题') info.title = meta.title || info.title;
       if (!info.author || info.author === '未知作者') info.author = meta.author || info.author;
@@ -603,8 +669,14 @@ async function extractVideoInfo(videoData, url) {
   const author = videoData.author || videoData.authorInfo || videoData.authorMeta || {};
 
   let videoUrl = '', hdVideoUrl = '';
+  // 质量由「实际取到了什么地址」决定，而不是由调用方按数据来源贴标签。
+  // 背景（2026-09-17 排查）：原实现里 parseViaFetchHtml 仅凭数据来自
+  // __UNIVERSAL_DATA__/SIGI_STATE 就贴「原画质」，于是几乎所有 TikTok 视频
+  // （页面必然含 __UNIVERSAL_DATA__）都被标成原画质，标签完全失真。
+  // 实际上 bitrateInfo 里的最高码率 PlayAddr 本身就是高清地址。
+  let qualityHint = '';
 
-  // 1. bitrateInfo 最高码率
+  // 1. bitrateInfo 最高码率 —— 这是明确的高清来源
   if (video.bitrateInfo && Array.isArray(video.bitrateInfo) && video.bitrateInfo.length > 0) {
     const sorted = [...video.bitrateInfo].sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
     const best = sorted[0];
@@ -614,27 +686,30 @@ async function extractVideoInfo(videoData, url) {
     else if (best?.UrlList?.length) addr = best.UrlList[0];
     else if (best?.urlList?.length) addr = best.urlList[0];
     else if (best?.url) addr = best.url;
-    if (addr?.startsWith('http')) { videoUrl = addr.trim(); hdVideoUrl = addr.trim(); }
+    if (addr?.startsWith('http')) { videoUrl = addr.trim(); hdVideoUrl = addr.trim(); qualityHint = '高清'; }
   }
 
-  // 2. downloadAddr
+  // 2. downloadAddr（官方无水印下载地址，同样是高清级）
   if (!videoUrl && video.downloadAddr) {
     let addr = '';
     if (typeof video.downloadAddr === 'string') addr = video.downloadAddr;
     else if (video.downloadAddr.urlList?.length) addr = video.downloadAddr.urlList[0];
     else if (video.downloadAddr.UrlList?.length) addr = video.downloadAddr.UrlList[0];
-    if (addr?.startsWith('http')) { videoUrl = addr.trim(); hdVideoUrl = addr.trim(); }
+    if (addr?.startsWith('http')) { videoUrl = addr.trim(); hdVideoUrl = addr.trim(); qualityHint = '高清'; }
   }
 
   // 3. 多字段遍历
   if (!videoUrl) {
     const fields = ['hdplay', 'playAddr', 'play', 'play_url', 'src', 'video_url', 'url'];
+    // 记住命中的字段名：hdplay/playAddr 是官方高清字段，用于质量判定
+    let hitField = '';
     for (const field of fields) {
       const val = video[field];
       if (!val) continue;
       if (typeof val === 'string' && val.startsWith('http')) {
         videoUrl = val.trim();
         if (field === 'hdplay' || field === 'playAddr') hdVideoUrl = val.trim();
+        hitField = field;
         break;
       }
       if (Array.isArray(val) && val.length) {
@@ -642,23 +717,26 @@ async function extractVideoInfo(videoData, url) {
         if (typeof first === 'string' && first.startsWith('http')) {
           videoUrl = first.trim();
           if (field === 'hdplay') hdVideoUrl = first.trim();
+          hitField = field;
           break;
         }
         if (first?.url?.startsWith('http')) {
           videoUrl = first.url.trim();
           if (field === 'hdplay') hdVideoUrl = first.url.trim();
+          hitField = field;
           break;
         }
       }
       if (val.urlList?.length) {
         const first = val.urlList[0];
-        if (first?.startsWith('http')) { videoUrl = first.trim(); if (field === 'hdplay') hdVideoUrl = first.trim(); break; }
+        if (first?.startsWith('http')) { videoUrl = first.trim(); if (field === 'hdplay') hdVideoUrl = first.trim(); hitField = field; break; }
       }
       if (val.UrlList?.length) {
         const first = val.UrlList[0];
-        if (first?.startsWith('http')) { videoUrl = first.trim(); if (field === 'hdplay') hdVideoUrl = first.trim(); break; }
+        if (first?.startsWith('http')) { videoUrl = first.trim(); if (field === 'hdplay') hdVideoUrl = first.trim(); hitField = field; break; }
       }
     }
+    if (videoUrl && (hitField === 'hdplay' || hitField === 'playAddr')) qualityHint = '高清';
   }
 
   // 4. 正则兜底（支持 mp4 和 m3u8）
@@ -690,7 +768,9 @@ async function extractVideoInfo(videoData, url) {
     videoUrl,
     hdVideoUrl,
     duration: video.duration || video.videoDuration || 0,
-    quality: '原画质',
+    // 取到了明确的最高码率/无水印下载地址即视为高清；否则交由调用方按来源判定。
+    // 不要把 '原画质' 写死在这里：那是"来源"语义，会让所有调用方都拿到错误的默认值。
+    quality: qualityHint,
     language: '',
     likes: formatLikes(rawLikes),
     createTime: formatDate(rawCreateTime)
@@ -765,13 +845,13 @@ async function enrichVideoAsync(video) {
       const comments = await fetchComments(video.id, 15);
       const textForLang = comments.join(' ').length > 20 ? comments.join(' ') : video.title;
       video.language = await detectLanguage(textForLang);
-
-      const cached = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
-      const idx = cached.findIndex(v => v.id === String(video.id));
-      if (idx !== -1) {
-        cached[idx].language = video.language;
-        await saveCachedVideos(cached);
-      }
+      // 走统一写入口：与解析入列、文件大小回填串行化，避免整表互相覆盖
+      await mutateCachedVideos((all) => {
+        const idx = all.findIndex(v => v.id === String(video.id));
+        if (idx === -1) return null;
+        all[idx].language = video.language;
+        return all;
+      });
     } catch (e) { console.warn('[异步补充] 失败:', e.message); }
   });
   return _enrichQueue;
@@ -1022,43 +1102,59 @@ function getApiList(encoded) {
 }
 
 // ============================================================
-//  API 熔断机制：连续失败3次后冷却5分钟，避免每次都等超时
+//  API 熔断机制：同一 API 主机连续失败3次后冷却5分钟，避免每次都等超时
+// 关键：key 必须是「API 身份」（主机名）。若用完整 URL（内含被解析的视频链接），
+// 每个视频都会生成一个全新 key，熔断将永远不会触发。
 // ============================================================
-const apiFailureCount = new Map();   // apiUrl -> 连续失败次数
-const apiCooldownUntil = new Map();  // apiUrl -> 冷却结束时间戳
+const apiFailureCount = new Map();   // apiHost -> 连续失败次数
+const apiCooldownUntil = new Map();  // apiHost -> 冷却结束时间戳
 const API_MAX_FAILURE = 3;
 const API_COOLDOWN_MS = 5 * 60 * 1000; // 5分钟
 
+// 从 API 请求 URL 提取稳定的熔断 key（主机名）
+function apiKey(apiUrl) {
+  try {
+    const u = new URL(apiUrl);
+    // 带 fragment 时并入 key：自建后端同一主机上有多个用途不同的 mode
+    // （api 走解析第一段，html/item 服务下载前取新签名），必须分开熔断，
+    // 否则 api 全灭会把 html/item 一起拖进冷却，下载取签名跟着失效。
+    return u.hostname + (u.hash || '');
+  } catch (e) { return String(apiUrl || '').slice(0, 80); }
+}
+
 function isApiInCooldown(apiUrl) {
-  const until = apiCooldownUntil.get(apiUrl);
+  const key = apiKey(apiUrl);
+  const until = apiCooldownUntil.get(key);
   if (until && Date.now() < until) return true;
-  if (until && Date.now() >= until) {
+  if (until) {
     // 冷却结束，重置
-    apiCooldownUntil.delete(apiUrl);
-    apiFailureCount.set(apiUrl, 0);
+    apiCooldownUntil.delete(key);
+    apiFailureCount.set(key, 0);
   }
   return false;
 }
 
 function recordApiSuccess(apiUrl) {
-  apiFailureCount.set(apiUrl, 0);
-  apiCooldownUntil.delete(apiUrl);
+  const key = apiKey(apiUrl);
+  apiFailureCount.set(key, 0);
+  apiCooldownUntil.delete(key);
 }
 
 function recordApiFailure(apiUrl) {
-  const count = (apiFailureCount.get(apiUrl) || 0) + 1;
-  apiFailureCount.set(apiUrl, count);
+  const key = apiKey(apiUrl);
+  const count = (apiFailureCount.get(key) || 0) + 1;
+  apiFailureCount.set(key, count);
   if (count >= API_MAX_FAILURE) {
-    apiCooldownUntil.set(apiUrl, Date.now() + API_COOLDOWN_MS);
-    console.warn(`[熔断] API ${apiUrl} 连续失败${count}次，冷却5分钟`);
+    apiCooldownUntil.set(key, Date.now() + API_COOLDOWN_MS);
+    console.warn(`[熔断] API ${key} 连续失败${count}次，冷却5分钟`);
   }
 }
 
-async function fetchAndParse(apiDef) {
+async function fetchAndParse(apiDef, timeoutMs = PARSE_FAST_HD_MS, signal = null) {
   const apiUrl = apiDef.url;
   try {
-    // 公共 API 单次超时 3 秒：失败快速短路，避免逐个降级时把 6s×N 全吃满
-    const resp = await fetchWithTimeout(apiUrl, {}, 3000);
+    // 单源上限与第一段窗口对齐（5s）：本函数只在第一段并行竞速里调用，竞速整体封顶同为 PARSE_FAST_HD_MS，不累加等待
+    const resp = await fetchWithTimeout(apiUrl, {}, timeoutMs, signal);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     const result = apiDef.parse(data);
@@ -1076,11 +1172,19 @@ async function fetchAndParse(apiDef) {
 // ============================================================
 // 本地拦截+主动抓取（抽成独立函数，用于并行调用）
 // 带3秒超时，快速失败不阻塞其他源
+//
+// 重要：拦截缓存是「按 tabId」存的，并不记录视频身份。若不加校验，用户粘贴 A 视频
+// 链接时会把当前标签页正在播放的 B 视频地址当作解析结果返回（下载到错误视频）。
+// 因此：请求里带了具体 videoId 时，标签页必须指向同一个视频；
+//       请求里本身没有 videoId（如推荐页/首页的“当前页”）才允许使用拦截结果。
 async function parseViaIntercept(finalUrl) {
   return Promise.race([
     (async () => {
       const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       if (!tabs?.[0]?.id) throw new Error('no tab');
+      const urlId = extractVideoIdFromUrl(finalUrl);
+      const tabId = extractVideoIdFromUrl(tabs[0].url || '');
+      if (urlId && urlId !== tabId) throw new Error('intercept video id mismatch');
       let captured = capturedVideoUrls.get(tabs[0].id);
       // 只有已拦截到才用，没拦截到不等待主动抓取（太慢）
       if (!captured?.hdVideoUrl) throw new Error('no intercepted url');
@@ -1107,18 +1211,240 @@ async function parseViaIntercept(finalUrl) {
   ]);
 }
 
+// ============================================================
+//  模块二点二：静默标签页抓取（服务端源失效后的主力通道）
+// ============================================================
+// 背景（2026-09-17 实测）：自建后端的页面直抓被 TikTok 以 HTTP 403 拒绝（CF 数据中心 IP
+// 全段被风控），官方 item 接口返回空结构——服务端已拿不到任何原画质地址。
+// 而浏览器本地通道是好的：TikTok 页面 HTML 里内嵌的 __UNIVERSAL_DATA_FOR_REHYDRATION__
+// 就含 playAddr（原画质无水印），走用户自己的出口 IP 与登录态，不受服务端风控影响。
+//
+// 因此：批量解析时若当前没有可用的拦截缓存，就静默开一个后台标签页把视频页加载一遍，
+// 由既有的 webRequest 拦截器抓下 CDN 地址，拿到后立即关闭标签页。
+//   优点：产出率与"手动打开视频页面"等价，是当前唯一能稳定出原画质的方式。
+//   代价：每个视频约 1~2 秒页面加载时间（远优于为死源白等 4~9 秒且零产出）。
+//
+// 约束：
+//   1) 标签页必须在任何退出路径上被关闭（成功/失败/超时/异常），否则会不断泄漏标签页；
+//   2) 必须沿用 videoId 校验——拦截缓存是按 tabId 存的，不校验就可能把重定向后的
+//      其它视频地址当成结果（下载到错误视频）；
+//   3) 批量场景下要限制同时打开的标签页数，避免一次性弹出几十个标签页。
+
+// 静默抓取的等待窗口：页面加载 + 播放器发起首段媒体请求，实测多在 1~2 秒内命中。
+// 【2026-11-02 调整】9s → 13s。实测网络层就要 2~3s（首字节 1.5~2.5s，375KB 页面），
+// 真实浏览器还要解析 HTML、执行 React 水合与风控脚本、初始化播放器，才发出媒体请求；
+// 并发 8 个后台标签页时 CPU 竞争会进一步拖慢。
+// 9s 正好卡在边缘 → "有时候解析失败"主要就是这里的超时。
+// 放宽到 13s 的预算来源：第一段服务端源已全灭并接入熔断，省下的 ~5s 让给这里，
+// 单条最坏耗时基本不变（熔断后 0+4+13≈17s，原为 5+4+9=18s），但有效窗口 +44%。
+const SILENT_TAB_TIMEOUT_MS = 13000;
+// 轮询拦截缓存的间隔：太密会空耗 CPU，太疏会白等
+const SILENT_TAB_POLL_MS = 200;
+// 并发上限必须跟上解析池的大批量宽度（pumpUntilIdle 内 poolSize 最大 8），
+// 否则这里会变成整条流水线的瓶颈：实测模型（1370 条，每条 18s 上限）——
+// 4 槽 = 103 分钟、8 槽 = 51 分钟，且把解析池从 4 放宽到 8 完全不产生收益。
+// 之所以敢开这么高：标签页是 active:false 的后台页，且命中后立即关闭（通常存活 1~2 秒），
+// 同时在线数远低于上限值。真正的风险是内存，因此配合 POOL 一道限制总量。
+const SILENT_TAB_MAX_CONCURRENT = 8;
+let _silentTabActive = 0;
+const _silentTabWaiters = [];
+
+function _acquireSilentSlot() {
+  if (_silentTabActive < SILENT_TAB_MAX_CONCURRENT) {
+    _silentTabActive++;
+    return Promise.resolve();
+  }
+  return new Promise(resolve => _silentTabWaiters.push(resolve));
+}
+function _releaseSilentSlot() {
+  const next = _silentTabWaiters.shift();
+  if (next) next();               // 名额直接移交给排队者，不递减计数
+  else _silentTabActive = Math.max(0, _silentTabActive - 1);
+}
+
+// 静默打开 → 等待拦截命中 → 关闭。
+// 返回与 parseViaIntercept 相同形状的结果对象；未命中则抛错（由竞速降级处理）。
+// 静默标签页失败时的现场诊断：把"为什么没抓到"变成一句可读的话。
+// 只读取状态、不改变页面行为；任何异常都吞掉，绝不影响主流程。
+// 【2026-11-05 新增】此前超时只报"未拦截到地址"，无法区分
+//   ① 页面被重定向到推荐流  ② 数据块返回 10204  ③ 后台标签页未被渲染导致播放器不发起请求
+//   —— 这三者的修法完全不同，必须能分开。
+async function diagnoseSilentTab(tabId, targetId) {
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const out = {};
+        try { out.url = location.href; } catch (e) { out.url = ''; }
+        try { out.vis = document.visibilityState; } catch (e) { out.vis = '?'; }
+        try {
+          const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+          if (!el) out.hasUniversal = false;
+          else {
+            out.hasUniversal = true;
+            try {
+              const j = JSON.parse(el.textContent || '{}');
+              const vd = j && j.__DEFAULT_SCOPE__ && j.__DEFAULT_SCOPE__['webapp.video-detail'];
+              out.statusCode = vd ? vd.statusCode : undefined;
+              out.statusMsg = String((vd && vd.statusMsg) || '').slice(0, 40);
+              const it = vd && vd.itemStruct;
+              out.hasItem = !!it;
+              out.playAddr = it && it.video && it.video.playAddr ? 1 : 0;
+              out.bitrate = it && it.video && Array.isArray(it.video.bitrateInfo)
+                ? it.video.bitrateInfo.length : 0;
+            } catch (e) { out.parseErr = String(e.message).slice(0, 40); }
+          }
+        } catch (e) {}
+        try {
+          out.videoTags = document.querySelectorAll('video').length;
+          const v = document.querySelector('video');
+          out.videoSrc = v ? String(v.currentSrc || v.src || '').slice(0, 70) : '';
+        } catch (e) {}
+        try {
+          out.mediaReqs = performance.getEntriesByType('resource')
+            .filter(e => /\.(mp4|m3u8|webm)/i.test(e.name) || e.initiatorType === 'video').length;
+        } catch (e) { out.mediaReqs = -1; }
+        return out;
+      }
+    });
+    const d = (r && r.result) || {};
+    const parts = [];
+    if (d.url) {
+      const m = String(d.url).match(/\/(?:video|v|note)\/(\d+)/);
+      const landed = m ? m[1] : '(非详情页)';
+      parts.push('落地=' + (landed === String(targetId) ? '一致' : landed));
+    }
+    if (d.vis) parts.push('visible=' + d.vis);
+    if (d.hasUniversal === false) parts.push('无UNIVERSAL块');
+    if (d.statusCode !== undefined) parts.push('statusCode=' + d.statusCode + (d.statusMsg ? ' ' + d.statusMsg : ''));
+    if (d.hasItem === false) parts.push('itemStruct缺失');
+    if (d.bitrate) parts.push('bitrate=' + d.bitrate);
+    if (d.videoTags !== undefined) parts.push('video标签=' + d.videoTags + (d.videoSrc ? '(' + d.videoSrc + ')' : ''));
+    if (d.mediaReqs !== undefined) parts.push('媒体请求=' + d.mediaReqs);
+    return parts.join(' · ') || '(无诊断信息)';
+  } catch (e) {
+    return '诊断不可用(' + String((e && e.message) || e).slice(0, 40) + ')';
+  }
+}
+
+async function parseViaSilentTab(finalUrl, timeoutMs = SILENT_TAB_TIMEOUT_MS) {
+  const urlId = extractVideoIdFromUrl(finalUrl);
+  // 只对标准视频详情页开标签页：推荐页/主页/短链展开后的非详情地址没有确定的目标视频，
+  // 开了也只会抓到"当前推荐流里的某个视频"，属于错误结果。
+  if (!urlId) throw new Error('silent tab: 非视频详情页，跳过');
+
+  await _acquireSilentSlot();
+  let tabId = null;
+  const startedAt = Date.now();
+  try {
+    const tab = await chrome.tabs.create({ url: finalUrl, active: false });
+    tabId = tab?.id;
+    if (!tabId) throw new Error('silent tab: 创建标签页失败');
+
+    // 轮询等待拦截器写入地址。webRequest 回调是异步的，无法在此处直接 await，
+    // 只能轮询缓存；同时穿插页面深挖作为加速路径（它直接读 DOM/脚本，往往更快）。
+    let captured = null;
+    let deepResult = null;
+    // 深挖必须限次 + 递增间隔。
+    // 【2026-11-05 修复】原先条件是「>600ms 且还没结果」，而轮询间隔只有 200ms
+    // → 每 200ms 就往页面注入一次脚本，8 个静默页并发时是每秒数十次注入。
+    // 这跟播放器初始化抢主线程，页面迟迟发不出媒体请求，**自己把自己拖到超时**。
+    // 现限定最多 4 次，节点取 0.6s / 2s / 5s / 9s。
+    const DEEP_AT_MS = [600, 2000, 5000, 9000];
+    let deepIdx = 0;
+    while (Date.now() - startedAt < timeoutMs) {
+      captured = capturedVideoUrls.get(tabId);
+      if (captured?.hdVideoUrl || captured?.videoUrl) break;
+      // 页面深挖必须显式指定「静默标签页」：该标签页是 active:false 的后台页，
+      // 若走默认的「当前激活标签页」，会读用户正在看的另一个页面（或被 videoId 校验挡下）。
+      // 这条路径通常比等拦截更快，且能一并带回标题/作者等元数据。
+      const elapsed = Date.now() - startedAt;
+      if (!deepResult && deepIdx < DEEP_AT_MS.length && elapsed >= DEEP_AT_MS[deepIdx]) {
+        deepIdx++;
+        try {
+          const d = await parseViaPageDeep(finalUrl, tabId);
+          if (d?.success) { deepResult = d; break; }
+        } catch (e) { /* 深挖失败不致命，继续等拦截 */ }
+      }
+      await sleep(SILENT_TAB_POLL_MS);
+    }
+
+    // 深挖成功优先返回（元数据更全）
+    if (deepResult?.success) return deepResult;
+
+    captured = capturedVideoUrls.get(tabId) || captured;
+    if (!captured?.hdVideoUrl && !captured?.videoUrl) {
+      // 带上现场诊断，便于一眼区分「重定向 / 10204 / 后台页未渲染」
+      const diag = await diagnoseSilentTab(tabId, urlId);
+      throw new Error('silent tab: 未拦截到地址（' + Math.round((Date.now() - startedAt) / 1000) + 's 超时）｜' + diag);
+    }
+
+    // 关键校验：标签页最终 URL 必须仍是同一个视频（TikTok 可能重定向/跳转到推荐流）。
+    // 不校验就会把"跳过去之后自动播放的另一个视频"当成结果，导致下载到错误内容。
+    let landedId = null;
+    try {
+      const info = await chrome.tabs.get(tabId);
+      landedId = extractVideoIdFromUrl(info?.url || '');
+    } catch (e) { /* 标签页已消失，交给下面的兜底判断 */ }
+    if (landedId && landedId !== urlId) {
+      throw new Error('silent tab: 落地视频不一致 ' + landedId + ' != ' + urlId);
+    }
+
+    let meta = {};
+    try { meta = await extractPageMeta(tabId) || {}; } catch (e) {}
+    return {
+      success: true,
+      originalUrl: finalUrl,
+      id: urlId,
+      title: meta.title || '无标题',
+      author: meta.author || '未知作者',
+      authorAvatar: '',
+      cover: meta.cover || '',
+      videoUrl: captured.videoUrl || captured.hdVideoUrl,
+      hdVideoUrl: captured.hdVideoUrl || captured.videoUrl,
+      duration: 0,
+      quality: '原画质',
+      language: '',
+      likes: '',
+      createTime: '',
+      _parseSource: 'silent_tab'
+    };
+  } finally {
+    // 任何路径都必须关掉标签页：用 finally 而非每处 catch，
+    // 否则超时/异常路径会持续泄漏标签页，长批量任务下会开出成百上千个。
+    if (tabId) {
+      try { await chrome.tabs.remove(tabId); } catch (e) { /* 已被用户手动关闭 */ }
+      capturedVideoUrls.delete(tabId);
+    }
+    _releaseSilentSlot();
+  }
+}
 
 // 自建解析后端“单 mode”请求：
-// html=页面直抓(含抖音 _ROUTER_DATA)、item=TikTok 官方接口、api=第三方源池。
-// 两段式解析里，html/item 属于第一段“原画质通道”，api 属于第二段“第三方池”。
-async function parseViaOwnBackendMode(finalUrl, mode) {
-  const resp = await fetchWithTimeout(
-    OWN_PARSE_API + '?url=' + encodeURIComponent(finalUrl) + '&token=' + OWN_PARSE_TOKEN + '&mode=' + mode,
-    {}, 6000);
-  if (!resp.ok) throw new Error('backend HTTP ' + resp.status);
-  const d = await resp.json();
-  if (!d || !d.success) throw new Error((d && d.error) || 'backend parse failed');
-  return {
+//   api  = 第三方源池（第一段“高清无水印快源”使用）
+//   html = 页面直抓，item = TikTok 官方接口（下载前取新签名时按需使用）
+// 注：解析主链路的第二段已不再调用 html/item —— 二者在服务端已失效（页面直抓 403、
+// 官方 item 返回空结构），调用只会白等窗口。这里的 html/item 仅服务于
+// fetchFreshDownloadUrls（该场景有独立超时，且失败可由旧地址兜底）。
+async function parseViaOwnBackendMode(finalUrl, mode, timeoutMs = 6000, signal = null) {
+  // 熔断 key 按 mode 分开（见 apiKey 对 fragment 的处理）：
+  // api 走解析第一段，html/item 服务下载前取新签名，互不牵连。
+  // 【2026-11-02 修复】原实现完全不接入熔断——第三方 API 连续失败 3 次会冷却 5 分钟，
+  // 自建后端却每次都全速打满窗口。而 09-19 / 11-02 两次实测三个 mode 均长期全灭，
+  // 于是每条视频都在第一段白等满 PARSE_FAST_HD_MS(5s)、零产出。
+  const fuseKey = OWN_PARSE_API + '#' + mode;
+  if (isApiInCooldown(fuseKey)) {
+    throw new Error('backend ' + mode + ' 冷却中（近期连续失败）');
+  }
+  try {
+    const resp = await fetchWithTimeout(
+      OWN_PARSE_API + '?url=' + encodeURIComponent(finalUrl) + '&token=' + OWN_PARSE_TOKEN + '&mode=' + mode,
+      {}, timeoutMs, signal);
+    if (!resp.ok) throw new Error('backend HTTP ' + resp.status);
+    const d = await resp.json();
+    if (!d || !d.success) throw new Error((d && d.error) || 'backend parse failed');
+    recordApiSuccess(fuseKey);
+    return {
     success: true,
     originalUrl: finalUrl,
     id: d.id || Date.now(),
@@ -1135,8 +1461,19 @@ async function parseViaOwnBackendMode(finalUrl, mode) {
     language: '',
     likes: d.likes || '',
     createTime: d.createTime || '',
-    _parseSource: 'own_backend'
-  };
+      // ssstik / tkdl 返回的都是它们自己的代理直链（有效期见各自说明），
+      // 不属于「页面当场签发的短命地址」，不应触发那轮取新签名（会白等最多 8s）。
+      // 注：tkdl 的 snapcdn JWT 约 1 小时有效，批量解析后要及时下载。
+      _parseSource: (mode === 'ssstik' || mode === 'tkdl') ? mode : 'own_backend'
+    };
+  } catch (e) {
+    // 竞速命中后 stage1Abort 会主动取消落败请求，那属正常竞争而非后端故障，
+    // 不能计入熔断（否则一次成功解析就会把其余源误判为故障、直接冷掉）。
+    // 同理，调用方 abort 造成的取消也不应记失败。
+    const aborted = e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')));
+    if (!aborted) recordApiFailure(fuseKey);
+    throw e;
+  }
 }
 
 // 判定一个媒体 URL 是否“明显带水印”（playwm / watermark=1 / /watermark/ 等）。
@@ -1170,62 +1507,126 @@ async function parseVideo(url, opts = {}) {
   const encoded = encodeURIComponent(finalUrl);
   const availableApis = getApiList(encoded).filter(api => !isApiInCooldown(api.url));
   const timeoutOf = (ms, msg) => new Promise((_, reject) => setTimeout(() => reject(new Error(msg)), ms));
+  // 逐段收集失败原因。原来每段 catch 只 console.log，最终统一返回「所有解析源均失败」，
+  // 用户和日志都看不出是超时、重定向还是 10204 —— 这三种修法完全不同，必须保留。
+  const failReasons = [];
   // 收尾：统一 originalUrl/id，并触发语言/评论异步补充。
   // 解析阶段不强制无水印：第一阶段扒到什么（含高清带水印）就用什么，速度优先；
   // “要无水印”在下载侧通过候选排序来满足（无水印优先，带水印作为降级保底）
   const finalize = (r) => {
-    if (!r || !r.success) throw new Error('parse fail');
+    // 带上原始原因：原来一律抛 'parse fail'，会把「静默标签页超时｜落地=推荐流」
+    // 这类关键线索直接抹掉，排查时只剩一句无信息量的报错。
+    if (!r || !r.success) throw new Error((r && r.error) || 'parse fail');
     r.originalUrl = finalUrl;
     r.id = r.id == null || r.id === '' ? String(Date.now()) : String(r.id);
+    // 展示字段归一化：第三方源会自己调 formatLikes/formatDate，而自建后端与页面直抓
+    // 返回的是原始数字（点赞数、Unix 时间戳）。不统一就会出现界面显示
+    // "📅 1785749013"、"❤️ 1904" 这种既难看又不一致的结果。
+    if (r.createTime) {
+      const ctStr = String(r.createTime);
+      // 已经是 "MM.DD" 形式的跳过，避免把格式化结果再当时间戳换算
+      if (!/^\d{1,2}\.\d{1,2}$/.test(ctStr)) r.createTime = formatDate(Number(r.createTime)) || '';
+    }
+    if (r.likes != null && r.likes !== '' && typeof r.likes === 'number') {
+      r.likes = formatLikes(r.likes);
+    }
     enrichVideoAsync(r);
     return r;
   };
 
-  // ===== 第一段（最多 2 秒）：“高清无水印”快源优先 =====
-  // 第三方 API(hdplay/no_watermark) + 自建后端 api 池，通常 <1s 返回，谁快用谁
+  // ===== 第一段（最多 5 秒）：“高清无水印”快源优先 =====
+  // 【2026-11-05 修正】此前只跑自建 `api` 一个 mode，而 `api`（第三方源池）长期全灭，
+  // 导致第一段每条视频白等满 5 秒、零产出，"有时解析不出来"由此而来。
+  // 实测发现被 09-17 误判为"已死"的 `html`（页面直抓）其实是**可用**的——
+  // 当时用的是失效视频做测试，把"视频不存在"误读成"通道失效"。
+  // 现在四个自研端口一起竞速（Promise.any 谁先成功用谁）：
+  //   html   ≈1.5s 页面直抓，返回真实 playAddr（主力）
+  //   tkdl   ≈1.1s tikdownloader/tikvid，给 snapcdn 直链，**有 HD 档**且实测不限流
+  //   ssstik ≈1.5s 第三方兑换直链（会限流，仅作补充）
+  //   api    兜底，第三方源池（多数已死，失败不影响其他三个）
+  const stage1Abort = new AbortController();
   const fastHdSources = [];
-  fastHdSources.push(parseViaOwnBackendMode(finalUrl, 'api').then(finalize).catch(e => { throw e; }));
+  for (const ownMode of ['html', 'tkdl', 'ssstik', 'api']) {
+    fastHdSources.push(
+      parseViaOwnBackendMode(finalUrl, ownMode, PARSE_FAST_HD_MS, stage1Abort.signal)
+        .then(finalize).catch(e => { throw e; })
+    );
+  }
   for (const api of availableApis) {
-    fastHdSources.push(fetchAndParse(api).then(r => {
+    fastHdSources.push(fetchAndParse(api, PARSE_FAST_HD_MS, stage1Abort.signal).then(r => {
       r._parseSource = 'third_party';
       return finalize(r);
     }).catch(e => { throw e; }));
   }
+  let rFast = null;
   try {
-    const rFast = await Promise.race([
+    rFast = await Promise.race([
       Promise.any(fastHdSources),
       timeoutOf(PARSE_FAST_HD_MS, '高清无水印快源超时')
     ]);
-    if (rFast?.success) return rFast;
   } catch (e) {
-    console.log('[解析] 第一段高清无水印未命中（' + PARSE_FAST_HD_MS + 'ms），切原画质通道:', e.message);
+    console.log('[解析] 第一段高清无水印未命中（' + PARSE_FAST_HD_MS + 'ms），切本地通道:', e.message);
+    failReasons.push('高清段:' + (e.message || e));
+  } finally {
+    stage1Abort.abort();
   }
+  if (rFast?.success) return rFast;
 
-  // ===== 第二段（最多 4 秒）：“原画质/无水印”慢通道兜底 =====
-  // 本地拦截 / 页面深度解析 / FetchHTML / 自建后端 html（抖音直抓）/ TikTok 官方 item。
+  // ===== 第二段 A（最多 4 秒）：已在手的本地通道 =====
+  // 「本地拦截 / 页面深挖 / FetchHTML」——走浏览器自身的登录态与出口 IP，
+  // 不受服务端数据中心 IP 被 TikTok 风控的影响。这一段的共同点是"无需新开页面"：
+  // 要么已有拦截缓存，要么当前标签页就在目标视频上，因此可以给较短窗口。
+  //
+  // 已移除：自建后端 html（页面直抓）/ item（TikTok 官方接口）两个源。
+  // 移除原因（2026-09-17 实测）：这两条在服务端已全线失效——页面直抓稳定返回
+  // HTTP 403（CF 数据中心 IP 被拒），官方 item 接口返回空结构（item-detail empty），
+  // 且自建后端未接入熔断，导致每个视频都要为它们白等满整个窗口，纯增延迟、零产出。
+  // 恢复条件：服务端换用可用数据源并部署后，再把这两条加回来。
+  //
+  // 注：opts.skipIntercept 目前无调用方设置（保留作为出口）；下载前的取新签名走的是
+  // fetchFreshDownloadUrls，不经过本函数的静默标签页通道，因此不会因下载而弹标签页。
+  const stage2Abort = new AbortController();
   const origSources = [];
-  origSources.push(parseViaOwnBackendMode(finalUrl, 'html').then(finalize).catch(e => { throw e; }));
-  if (/\/video\/\d+|\/v\/\d+/.test(finalUrl)) {
-    origSources.push(parseViaOwnBackendMode(finalUrl, 'item').then(finalize).catch(e => { throw e; }));
-  }
-  // 下载重试不再走本函数；本地拦截保留用于常规解析（拦截缓存里通常是最新的无水印地址）
+  // 本地拦截保留用于常规解析（拦截缓存里通常是最新的无水印地址）
   if (!opts.skipIntercept) {
     origSources.push(parseViaIntercept(finalUrl).then(finalize).catch(e => { throw e; }));
   }
   origSources.push(parseViaPageDeep(finalUrl).then(finalize).catch(e => { throw e; }));
-  origSources.push(parseViaFetchHtml(finalUrl).then(finalize).catch(e => { throw e; }));
+  origSources.push(parseViaFetchHtml(finalUrl, stage2Abort.signal).then(finalize).catch(e => { throw e; }));
 
+  let rOrig = null;
   try {
-    const rOrig = await Promise.race([
+    rOrig = await Promise.race([
       Promise.any(origSources),
-      timeoutOf(PARSE_ORIG_MS, '原画质通道超时')
+      timeoutOf(PARSE_ORIG_MS, '本地通道超时')
     ]);
-    if (rOrig?.success) return rOrig;
   } catch (e) {
-    console.log('[解析] 原画质兜底也未命中:', e.message);
+    console.log('[解析] 本地通道未命中（' + PARSE_ORIG_MS + 'ms）:', e.message);
+    failReasons.push('本地:' + (e.message || e));
+  } finally {
+    stage2Abort.abort();
+  }
+  if (rOrig?.success) return rOrig;
+
+  // ===== 第二段 B（最多 9 秒）：静默标签页抓取 =====
+  // 页面不在当前标签页、拦截缓存也为空时的兜底：静默开一个后台标签页把视频页加载一遍，
+  // 由 webRequest 拦截器抓下 CDN 地址后立即关闭。这是服务端源失效后唯一能稳定出原画质的通道。
+  // 单独给窗口而不是并入上一段：它要真实加载页面（1~2s 起步），沿用 4 秒会大面积误杀。
+  try {
+    const r = await parseViaSilentTab(finalUrl, SILENT_TAB_TIMEOUT_MS);
+    const fin = finalize(r);
+    if (fin?.success) return fin;
+  } catch (e) {
+    console.log('[解析] 静默标签页未命中:', e.message);
+    failReasons.push('静默:' + (e.message || e));
   }
 
-  return { success: false, originalUrl: finalUrl, error: '所有解析源均失败' };
+  return {
+    success: false,
+    originalUrl: finalUrl,
+    error: '所有解析源均失败' +
+      (failReasons.length ? '｜' + [...new Set(failReasons)].slice(0, 3).join(' / ').slice(0, 220) : '')
+  };
 }
 
 function extractVideoIdFromUrl(url) {
@@ -1280,7 +1681,6 @@ async function extractPageMeta(tabId) {
 // ============================================================
 let parseTask = null;        // 池当前进度对象（供 popup 轮询/展示）
 let parsePending = [];       // 待解析项 [{url, allowDuplicate}]，未被 worker 领走的
-let stopParseRequested = false;
 let poolRunning = false;     // 是否已有池在工作（防并发起多个池）
 const PARSE_POOL = 3;        // 同时解析的视频数
 const POOL_IDLE_MS = 800;    // 池空闲多久算本批结束（给新提交一个合并窗口）
@@ -1308,6 +1708,8 @@ async function startBackgroundParse(urls, allowDuplicate = false) {
   // 池正在运行：直接并入当前任务（total 动态增长），由空闲 worker 接着领
   if (parseTask && parseTask.status === 'running') {
     parseTask.total += items.length;
+    // 新并入的条目都还没解析成功，待完成量同步增加（否则进度会显示成负数/倒退）
+    parseTask.pending = (parseTask.pending || 0) + items.length;
     writeParseProgress(parseTask);
   }
   ensurePool();
@@ -1329,47 +1731,73 @@ function ensurePool() {
   })();
 }
 
-// 解析成功“即时入列表”：每解出一个就写一次缓存（串行队列防并发写丢失），
-// 这样弹窗/侧边栏在解析过程中就能看到已完成的那几条，而不是等整批结束一次性出现。
-let _cacheSaveQueue = Promise.resolve();
-function persistParsedToCache(video) {
-  _cacheSaveQueue = _cacheSaveQueue.then(async () => {
+// ---------- cachedVideos 的唯一写入口 ----------
+// 背景：解析结果即时入列表、语言异步补充、文件大小异步回填，原本各自
+// load → 改 → save 整表，三条链路并发时会互相覆盖（表现为“解析成功但列表里没有”
+// 或文件大小丢失）。这里把所有读改写串行化到同一条队列上，从根上消除丢失更新。
+const CACHED_MAX = 200;
+let _cacheWriteQueue = Promise.resolve();
+function mutateCachedVideos(mutator) {
+  _cacheWriteQueue = _cacheWriteQueue.then(async () => {
     try {
-      let all = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
-      const id = String(video.id);
-      if (!all.some(v => v.id === id)) all.unshift({ ...video, id });
-      if (all.length > 200) all = all.slice(0, 200);
-      await saveCachedVideos(all);
-    } catch (e) { console.warn('[缓存] 增量写入失败:', e.message); }
+      const all = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
+      const next = mutator(all);
+      if (next) await saveCachedVideos(next);
+    } catch (e) { console.warn('[缓存] 写入失败:', e.message); }
   });
-  return _cacheSaveQueue;
+  return _cacheWriteQueue;
+}
+
+// 解析成功“即时入列表”：每解出一个就写一次缓存，
+// 这样弹窗/侧边栏在解析过程中就能看到已完成的那几条，而不是等整批结束一次性出现。
+function persistParsedToCache(video) {
+  return mutateCachedVideos((all) => {
+    const id = String(video.id);
+    if (all.some(v => v.id === id)) return null; // 已存在，无需写
+    all.unshift({ ...video, id });
+    return all.length > CACHED_MAX ? all.slice(0, CACHED_MAX) : all;
+  });
 }
 
 // 跑一批：3 个 worker 同时从 parsePending 领 URL，直到队列空 + 空闲一段时间才算本批结束
 async function pumpUntilIdle() {
   const task = {
     id: Date.now(), total: parsePending.length, completed: 0,
-    success: 0, failed: 0, skipped: 0, status: 'running', startedAt: Date.now(), stopped: false
+    success: 0, failed: 0, skipped: 0, pending: parsePending.length,
+    status: 'running', startedAt: Date.now(), stopped: false
   };
   parseTask = task;
-  stopParseRequested = false;
   const results = [];
   const failedUrls = [];
+  // 与 failedUrls 一一对应的失败原因。原来只存 URL，用户只看到「N 个失败」，
+  // 完全无法判断是超时、被重定向还是 10204，只能靠猜。
+  const failedReasons = [];
+  const pushFail = (u, reason) => {
+    failedUrls.push(u);
+    failedReasons.push(String(reason || '未知原因').slice(0, 220));
+  };
   let skippedCount = 0;
   let completed = 0;
   // 统一字符串 id：历史缓存里可能存在 number/string 混存或超过 2^53 丢失精度的 id
   const existing = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
   // 每次写进度前先回填计数，否则 popup 看到的 completed 会一直是 0
+  // pending =「还没成功解析出来」的数量 = 总数 - 成功数 - 跳过数（跳过视为已达成目标）。
+  // UI 展示的是它，而不是 completed：用户关心的是"还剩多少没拿到"，
+  // 而 completed 会把失败项也算作"已完成"，看起来像在推进、实际没有产出。
   const persist = () => {
     task.completed = completed;
     task.success = results.length;
     task.failed = failedUrls.length;
     task.skipped = skippedCount;
+    task.pending = Math.max(0, task.total - results.length - skippedCount);
     return writeParseProgress(task);
   };
 
   // 带重试的解析函数
   async function parseWithRetry(url, maxRetries = 1) {
+    // 保留最后一次失败原因：原来重试耗完后直接 return { success:false }，
+    // 把 parseVideo 已经算出来的具体原因（超时/重定向/10204）整个丢掉。
+    let lastError = '';
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         const result = await Promise.race([
@@ -1377,18 +1805,23 @@ async function pumpUntilIdle() {
           new Promise((_, reject) => setTimeout(() => reject(new Error('解析超时')), 60000))
         ]);
         if (result.success) return result;
+        lastError = (result && result.error) || lastError;
         if (attempt < maxRetries) await sleep(500);
       } catch (e) {
+        lastError = (e && e.message) || lastError;
         if (attempt < maxRetries) await sleep(500);
         else throw e;
       }
     }
-    return { success: false };
+    return { success: false, error: lastError || '解析失败（无详情）' };
   }
 
   let lastPullAt = Date.now();
   async function worker() {
-    while (!stopParseRequested) {
+    // 用「本批任务的 stopped 标记」而不是全局变量作为停止条件：
+    // 每批任务有各自的 task 对象，停止因此天然只作用于被点停的那一批，
+    // 不会误伤随后提交的新任务（旧实现的全局标记会让新批次出现无人领取的空档）。
+    while (!task.stopped) {
       // 用 pop() 取队尾：长队列下 shift() 是 O(n)，几千条会拖慢整体
       const item = parsePending.pop();
       if (!item) {
@@ -1425,9 +1858,9 @@ async function pumpUntilIdle() {
             await persistParsedToCache(result);
           }
         } else {
-          failedUrls.push(url);
+          pushFail(url, result && result.error);
         }
-      } catch (e) { failedUrls.push(url); }
+      } catch (e) { pushFail(url, e && e.message); }
 
       completed++;
       await persist();
@@ -1447,11 +1880,21 @@ async function pumpUntilIdle() {
 
   task.status = 'done';
   task.completedAt = Date.now();
+  // 收尾时归零：本批已结束，界面不应再显示"剩余 N 条未成功"的进行中文案
+  task.pending = 0;
+  // 失败原因一并落库：popup 侧即使错过通知，也能从 parseProgress 里读到具体原因。
+  // 只保留前 20 条，避免长批量把 storage 写爆。
+  task.failedReasons = failedReasons.slice(0, 20);
   await writeParseProgress(task);
 
-  let msg = `已解析 ${results.length} 个视频`;
+  let msg = `成功 ${results.length} 个`;
   if (skippedCount > 0) msg += `，跳过 ${skippedCount} 个已存在`;
-  if (failedUrls.length > 0) msg += `，${failedUrls.length} 个失败`;
+  if (failedUrls.length > 0) {
+    msg += `，${failedUrls.length} 个失败`;
+    // 通知里带上主要原因：只报"失败 N 个"等于没说，用户无法判断该查网络还是该重登。
+    const uniq = [...new Set(failedReasons.map(r => String(r).split('｜')[0].trim()).filter(Boolean))];
+    if (uniq.length) msg += `（${uniq.slice(0, 2).join('；')}${uniq.length > 2 ? ' 等' : ''}）`;
+  }
   const title = task.stopped ? '⏹ 已停止解析' : (results.length > 0 ? '✅ 解析完成' : '⚠️ 解析完成');
   showNotification({ type: 'basic', iconUrl: 'icons/icon128.png', title, message: msg, priority: 2 });
 
@@ -1462,20 +1905,22 @@ async function pumpUntilIdle() {
 // 后台获取文件大小（按 video.id 查找，修复 index 错位 bug）
 async function fetchVideoSizeInBackground(video) {
   const url = video.hdVideoUrl || video.videoUrl;
-  if (!url) return;
+  if (!url || !/^https?:\/\//i.test(url)) return;
   try {
     const resp = await fetchWithTimeout(url, { method: 'HEAD' }, 10000);
     const len = resp.headers.get('Content-Length');
     if (!len) return;
     const fileSize = parseInt(len);
+    if (!Number.isFinite(fileSize) || fileSize <= 0) return;
 
-    // 重新读取最新缓存，按 id 查找后更新（字符串化比较，兼容历史缓存中的 number/string id）
-    const current = (await loadCachedVideos()).map(v => ({ ...v, id: String(v.id) }));
-    const idx = current.findIndex(v => v.id === String(video.id));
-    if (idx !== -1) {
-      current[idx].fileSize = fileSize;
-      await saveCachedVideos(current);
-    }
+    // 走统一写入口（字符串化比较，兼容历史缓存中的 number/string id），
+    // 避免与解析入列并发时互相覆盖
+    await mutateCachedVideos((all) => {
+      const idx = all.findIndex(v => v.id === String(video.id));
+      if (idx === -1) return null;
+      all[idx].fileSize = fileSize;
+      return all;
+    });
   } catch (e) { console.warn('文件大小获取失败:', e.message); }
 }
 
@@ -1510,16 +1955,55 @@ function removeDownloadProgress(downloadId) {
   scheduleProgressBroadcast();
 }
 
-// 错误码翻译
+// 下载状态对账：MV3 的 SW 被回收后内存进度表会丢，而 storage 里的旧进度会残留成
+// “幽灵进度条”（永远停在下载中）。这里以 chrome.downloads 的真实状态为准重建进度表：
+// 仍在进行的保留并刷新字节数，已完成/已中断的清除。
+async function reconcileDownloadProgress() {
+  try {
+    const stored = (await chrome.storage.local.get('downloadProgress')).downloadProgress || {};
+    const items = await chrome.downloads.search({ state: 'in_progress' });
+    const live = {};
+    for (const it of items) {
+      const prev = stored[it.id];
+      if (!prev) continue; // 不是本扩展创建的下载，不接管
+      live[it.id] = {
+        ...prev,
+        state: 'in_progress',
+        bytesReceived: it.bytesReceived || prev.bytesReceived || 0,
+        totalBytes: it.totalBytes || prev.totalBytes || 0
+      };
+    }
+    downloadProgressMap.clear();
+    for (const [id, p] of Object.entries(live)) downloadProgressMap.set(Number(id), p);
+    await chrome.storage.local.set({ downloadProgress: live });
+    if (Object.keys(stored).length !== Object.keys(live).length) {
+      console.log(`[下载] 进度对账完成：清理 ${Object.keys(stored).length - Object.keys(live).length} 条残留记录`);
+    }
+  } catch (e) {
+    console.warn('[下载] 进度对账失败:', e.message);
+  }
+}
+
+// 错误码翻译（覆盖 chrome.downloads.InterruptReason 的全部常见取值，
+// 避免用户只看到 FILE_NAME_TOO_LONG 之类的原始英文码）
 function translateDownloadError(errorCode) {
   const map = {
-    'NETWORK_FAILED': '网络连接失败', 'NETWORK_IO_ERROR': '网络读写错误',
-    'NETWORK_DISCONNECTED': '网络已断开', 'SERVER_ERROR': '服务器错误',
-    'SERVER_BAD_CONTENT': '服务器返回内容异常', 'SERVER_UNREACHABLE': '无法连接服务器',
+    'NETWORK_FAILED': '网络连接失败', 'NETWORK_TIMEOUT': '网络超时', 'NETWORK_IO_ERROR': '网络读写错误',
+    'NETWORK_DISCONNECTED': '网络已断开', 'NETWORK_SERVER_DOWN': '服务器无响应',
+    'NETWORK_INVALID_REQUEST': '网络请求无效',
+    'SERVER_FAILED': '服务器错误', 'SERVER_ERROR': '服务器错误', 'SERVER_NO_RANGE': '服务器不支持断点续传',
+    'SERVER_BAD_CONTENT': '服务器返回内容异常', 'SERVER_UNAUTHORIZED': '服务器拒绝访问（需鉴权）',
+    'SERVER_CERT_PROBLEM': '服务器证书错误', 'SERVER_FORBIDDEN': '服务器禁止访问',
+    'SERVER_UNREACHABLE': '无法连接服务器', 'SERVER_CONTENT_LENGTH_MISMATCH': '文件大小与服务器声明不一致',
+    'SERVER_CROSS_ORIGIN_REDIRECT': '服务器跨域重定向被拒绝',
     'FILE_FAILED': '文件保存失败', 'FILE_ACCESS_DENIED': '没有文件夹写入权限',
     'FILE_NO_SPACE': '磁盘空间不足', 'FILE_TOO_LARGE': '文件过大',
-    'FILE_VIRUS_INFECTED': '文件被安全软件拦截', 'USER_CANCELED': '用户取消下载',
-    'USER_SHUTDOWN': '系统关机中断', 'TIMEOUT': '下载超时'
+    'FILE_NAME_TOO_LONG': '文件名过长，请缩短保存路径',
+    'FILE_TRANSIENT_ERROR': '文件系统临时错误', 'FILE_BLOCKED': '文件被阻止',
+    'FILE_SECURITY_CHECK_FAILED': '文件安全校验失败', 'FILE_TOO_SHORT': '文件内容不完整',
+    'FILE_VIRUS_INFECTED': '文件被安全软件拦截', 'FILE_HASH_MISMATCH': '文件校验不一致',
+    'USER_CANCELED': '用户取消下载', 'USER_SHUTDOWN': '系统关机中断',
+    'CRASH': '浏览器异常中断', 'TIMEOUT': '下载超时'
   };
   return map[errorCode] || errorCode || '未知错误';
 }
@@ -1528,14 +2012,41 @@ function translateDownloadError(errorCode) {
 //  模块九：下载核心（优化版）
 // ============================================================
 
+// 文件名安全化：
+//  - 过滤非法字符与控制字符，压缩空白
+//  - 去掉结尾的点与空格（Windows 上会导致保存失败或静默改名）
+//  - 按 UTF-8 字节数截断（NTFS 单段文件名上限 255 字节；这里留足余量，
+//    因为 Chrome 还会在重名时追加 " (1)"，且要预留扩展名）
+function safeFileName(text, maxBytes = 120) {
+  // 顺序很重要：先把空白（含 tab/换行）归并为单个空格，再替换非法字符，
+  // 否则制表符会先被控制字符规则变成下划线，得到 "a b_c" 这种奇怪结果
+  let s = String(text == null ? '' : text)
+    .replace(/\s+/g, ' ')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .trim()
+    .replace(/[. ]+$/, '');
+  const byteLen = (t) => new TextEncoder().encode(t).length;
+  if (byteLen(s) > maxBytes) {
+    let out = '';
+    for (const ch of s) {
+      if (byteLen(out + ch) > maxBytes) break;
+      out += ch;
+    }
+    s = out.replace(/[. ]+$/, '');
+  }
+  return s;
+}
+
 // ---------- 图集下载：逐张下载图片（监听每张完成/失败，结束后清理进度） ----------
 async function downloadPhotoImages(video, language = '') {
-  const images = (Array.isArray(video.images) ? video.images : []).filter(u => u && /^https?:/.test(u));
+  const images = (Array.isArray(video.images) ? video.images : []).filter(u => u && /^https?:\/\//i.test(u));
   if (!images.length) return { success: false, error: '无图片链接' };
-  let safeAuthor = (video.author || 'unknown').replace(/[\\/:*?"<>|]/g, '_');
-  if (safeAuthor.length > 50) safeAuthor = safeAuthor.substring(0, 50);
   const dateStr = video.createTime ? String(video.createTime).replace(/[^\d.]/g, '') : '';
-  const base = [video.likes, dateStr, safeAuthor].filter(Boolean).join('_') || 'tiktok_photo';
+  // 与视频命名保持一致：标题参与命名，避免同作者同日期图集大量重名；
+  // 总长按字节截断并过滤非法/尾字符，防止 FILE_NAME_TOO_LONG 与 Windows 保存失败
+  const base = safeFileName(
+    [video.likes, dateStr, video.author || 'unknown', video.title].filter(Boolean).join('_'), 110
+  ) || 'tiktok_photo';
   const downloadIds = [];
 
   // 启动一张图片：直连下载；被拒/失败时自动改走自建代理
@@ -1569,16 +2080,20 @@ async function downloadPhotoImages(video, language = '') {
   // 等待单张图片结束（complete / interrupted / 超时），结束后写状态并清理进度
   const waitFinish = (downloadId) => new Promise((resolve) => {
     let settled = false;
+    // listener / timer 先声明再赋值：finish 会在 search 回调或超时里被调用，
+    // 若两者仍处于 TDZ 会抛 ReferenceError
+    let listener = null;
+    let timer = null;
     const finish = (state, error) => {
       if (settled) return;
       settled = true;
-      chrome.downloads.onChanged.removeListener(listener);
-      clearTimeout(timer);
+      if (listener) chrome.downloads.onChanged.removeListener(listener);
+      if (timer) clearTimeout(timer);
       updateDownloadProgress(downloadId, { state, error: error || '' });
       setTimeout(() => removeDownloadProgress(downloadId), 5000);
       resolve(state === 'complete');
     };
-    const listener = (delta) => {
+    listener = (delta) => {
       if (delta.id !== downloadId || settled) return;
       if (delta.state?.current === 'complete') finish('complete');
       else if (delta.error?.current) finish('error', translateDownloadError(delta.error.current));
@@ -1591,7 +2106,7 @@ async function downloadPhotoImages(video, language = '') {
       if (it.state === 'complete') finish('complete');
       else if (it.state === 'interrupted') finish('error', translateDownloadError(it.error || '未知错误'));
     });
-    const timer = setTimeout(() => finish('error', '图片下载超时'), 60000);
+    timer = setTimeout(() => finish('error', '图片下载超时'), 60000);
   });
 
   const states = await Promise.all(downloadIds.map(waitFinish));
@@ -1614,43 +2129,76 @@ const DIRECT_FRIENDLY_HOSTS = [
 function isDirectFriendlyHost(rawUrl) {
   try {
     const h = new URL(rawUrl).hostname.toLowerCase();
-    if (h.includes('tiktokcdn') || h === 'webapp-prime.tiktok.com' || h.endsWith('-webapp-prime.tiktok.com')
-        || h === 'tiktokv.com' || h.endsWith('.tiktokv.com')) return true;
+    // 【2026-09-21 修复】`*-webapp-prime.tiktok.com` 必须排除在直连之外：
+    // 它正是 Akamai 上校验最严的域（要求 Referer/Cookie），而 chrome.downloads 直连
+    // 【无法携带 Referer】——Referer 属 forbidden header，且 DownloadOptions 没有
+    // referrer 参数（只有 url/filename/headers 等）。因此直连必然 403，
+    // 还要白等满 FIRST_STALL_CHECK_MS(30s) 才降级到代理。
+    // 这正是"解析出原画质却下不下来"的直接原因之一（另一个是线上代理为旧版）。
+    // 交给代理处理：代理侧已正确设置 Referer + Cookie + 多轮重试。
+    if (h === 'webapp-prime.tiktok.com' || h.endsWith('-webapp-prime.tiktok.com')) return false;
+    // tiktokv 有多个区域 TLD（.com / .eu / .asia ...），不能只认 .com：
+    // 实测页面已出现 starling16-normal-useastred.tiktokv.eu 这类主机。
+    if (h.includes('tiktokcdn')) return true;
+    if (/(^|\.)tiktokv\.[a-z.]+$/.test(h)) return true;
     return DIRECT_FRIENDLY_HOSTS.some(d => h === d || h.endsWith('.' + d));
   } catch (e) { return false; }
 }
 
-// A：走代理前先让自建代理 HEAD 探测一次。返回：
-//   false = 明确是“错误页/过期链接”（200 + html/json/text），跳过该候选；
-//   true  = 看起来可取流；null = 无法判断（HEAD 被 CDN 拒绝但 GET 可能能通）→ 仍发起真实下载试一次，
-//   避免“HEAD 403 其实 GET 能下”的原画质被全部误杀。
+// A：走代理前先让自建代理探测一次候选是否真的可取流。
+// 用 GET + Range:bytes=0-0 而不是 HEAD：HEAD 响应按规范没有 body，拿不到代理返回的
+// 结构化错误（如 502 upstream failed），排查时只剩一句"服务器错误"无从下手；
+// 而该请求成功时只传输 1 个字节，成本可忽略。
+// 返回：
+//   false     = 明确是"错误页/过期链接"（200 + html/json/text），跳过该候选；
+//   'blocked' = 代理本身不可用（401 token 不符 / 429 触发限流），继续换候选也没用；
+//   null      = 无法判断 → 仍然发起真实下载试一次。
 async function probeProxyCandidate(proxyUrl) {
   try {
-    const resp = await fetchWithTimeout(proxyUrl, { method: 'HEAD', headers: { 'Range': 'bytes=0-0' } }, 6000);
+    const resp = await fetchWithTimeout(proxyUrl, { headers: { 'Range': 'bytes=0-0' } }, 8000);
     const ct = (resp.headers.get('content-type') || '').toLowerCase();
-    if (resp.ok && ct && (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain'))) {
+    const isTextual = ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain');
+    if (resp.status === 401 || resp.status === 429) {
+      let detail = '';
+      try { detail = (await resp.text()).slice(0, 120); } catch (e) {}
+      console.warn(`[下载] 代理不可用 HTTP ${resp.status} ${detail}` +
+        (resp.status === 401 ? '（token 不一致：后端已开启鉴权，请确认三处 token 相同）' : '（已触发 IP 限流）'));
+      return 'blocked';
+    }
+    if (resp.ok && isTextual) {
       return false; // 200 + 网页/JSON/文本 → 过期签名返回的错误页
     }
-    return null; // 其它（含 HEAD 非 2xx）：不武断跳过，交给真实下载验证
+    if (!resp.ok && isTextual) {
+      // 把代理的结构化错误打出来：CDN 风控（lastStatus=403）与网络异常（lastStatus=-1）
+      // 的处理方式完全不同，没有这行日志就只能靠猜
+      let detail = '';
+      try { detail = (await resp.text()).slice(0, 200); } catch (e) {}
+      console.warn(`[下载] 代理探测异常 HTTP ${resp.status}: ${detail}`);
+      return null; // 不武断跳过：CDN 风控是间歇性的，真实下载仍可能成功
+    }
+    return null; // 其它（含非 2xx 非文本）：交给真实下载验证
   } catch (e) { return null; }
 }
 
-// 下载专用“取新签名”：不走 UI 的 3s/2s 快速窗口，给更充足时间（每 mode 最长 8s）并只保留无水印地址，
+// 下载专用“取新签名”：不走 UI 的快速窗口，给更充足时间（每 mode 最长 8s）并只保留无水印地址，
 // 提高“原画质下载前拿新鲜链接”的成功率
 async function fetchFreshDownloadUrls(originalUrl) {
   const modes = ['html', 'api'];
   if (/\/video\/\d+|\/v\/\d+|\/note\/\d+/.test(originalUrl)) modes.push('item');
+  const abort = new AbortController();
   const tries = modes.map(m => fetchWithTimeout(
     OWN_PARSE_API + '?url=' + encodeURIComponent(originalUrl) + '&token=' + OWN_PARSE_TOKEN + '&mode=' + m,
-    {}, 8000
+    {}, 8000, abort.signal
   ).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
    .then(d => (d && d.success) ? d : Promise.reject(new Error('no success'))));
   let d = null;
   try { d = await Promise.any(tries); } catch (e) { return { success: false }; }
+  finally { abort.abort(); } // 命中后取消其余 mode 的请求
+  const isHttp = (u) => /^https?:\/\//i.test(u);
   const hd = String(d.hdVideoUrl || '').trim();
   const v = String(d.videoUrl || '').trim();
-  const cleanHd = looksWatermarked(hd) ? '' : hd;
-  const cleanV = (v && !looksWatermarked(v)) ? v : '';
+  const cleanHd = (hd && isHttp(hd) && !looksWatermarked(hd)) ? hd : '';
+  const cleanV = (v && isHttp(v) && !looksWatermarked(v)) ? v : '';
   return {
     success: !!(cleanHd || cleanV),
     freshUrl: cleanHd || cleanV,
@@ -1658,8 +2206,42 @@ async function fetchFreshDownloadUrls(originalUrl) {
   };
 }
 
+// 「短命签名地址」来源判定：这些通道拿到的都是页面/接口当场签发的 CDN 地址，
+// 有效期短、且校验 Referer/Cookie，下载前值得再取一次新签名。
+//
+// 必须用**精确列举**而不是宽泛前缀（原实现用 `fetch_` 前缀，把所有 fetch_* 一网打尽，
+// 连 fetch_next 这种明确的高清来源也被当成原画质；`page` 子串同样过宽——
+// 任何含 "page" 的源名都会命中）。2026-09-17 排查确认。
+const SHORT_LIVED_SOURCES = new Set([
+  'intercept',       // 页内 webRequest 拦截（playAddr）
+  'silent_tab',      // 静默标签页拦截（playAddr）
+  'own_backend',     // 自建后端（服务端签发）
+  'page',            // 页面深挖的 page 分支
+  // 以下为「页面 HTML / DOM 当场签发」的地址，有效期短、校验 Referer/Cookie，
+  // 一律需要取新签名——不能因为"标签可能是高清"就跳过：
+  'universal',       // parseViaPageDeep: 页内 __UNIVERSAL_DATA__
+  'sigi',            // parseViaPageDeep: SIGI_STATE
+  'fetch_universal', // parseViaFetchHtml: __UNIVERSAL_DATA__
+  'fetch_sigi',      // parseViaFetchHtml: SIGI_STATE
+  'fetch_next',      // parseViaFetchHtml: __NEXT_DATA__
+  'fetch_field',     // 正则搜到的 playAddr/hdplay 字段
+  'fetch_regex',     // 正则搜到的完整 mp4 地址
+  'script_field',    // parseViaPageDeep: <script> 内字段
+  'script_regex',    // parseViaPageDeep: <script> 内 URL
+]);
+function isShortLivedSource(video) {
+  const src = String((video && video._parseSource) || '').trim().toLowerCase();
+  if (!src) return false;
+  if (SHORT_LIVED_SOURCES.has(src)) return true;
+  // 前缀兜底：源名可能带后缀（如 own_backend_api），按明确前缀匹配，不再吞掉 fetch_next
+  return /^(?:intercept|silent_tab|own_backend|page)(?:[_\-].*)?$/.test(src);
+}
+
 async function downloadSingleVideo(video, language = '') {
-  const url = (video.hdVideoUrl || video.videoUrl || '').trim();
+  const rawUrl = (video.hdVideoUrl || video.videoUrl || '').trim();
+  // 解析结果来自不可控第三方，必须校验协议后才交给 chrome.downloads
+  // （否则可能把 javascript:/data: 之类的地址传下去）
+  const url = /^https?:\/\//i.test(rawUrl) ? rawUrl : '';
   // 图集：无视频链接但有图片列表 → 逐张下载图片
   if (!url && Array.isArray(video.images) && video.images.length) {
     return downloadPhotoImages(video, language);
@@ -1667,8 +2249,7 @@ async function downloadSingleVideo(video, language = '') {
   if (!url) return { success: false, error: '无视频链接', url: null };
 
   // “原画质(无水印)”判定：失败满 3 次后允许自动降级到高清/带水印地址下载
-  const isOrigQuality = /原画质/.test(String(video.quality || ''))
-    || /intercept|universal|sigi|own_backend|fetch_|_page|page/i.test(String(video._parseSource || ''));
+  const isOrigQuality = /原画质/.test(String(video.quality || '')) || isShortLivedSource(video);
   const failKey = isOrigQuality ? String(video.id || video.originalUrl || '') : '';
   const allowFallback = isOrigQuality && (originalQualityFailCounts.get(failKey) || 0) >= 3;
   const recordOrigFail = () => {
@@ -1679,21 +2260,18 @@ async function downloadSingleVideo(video, language = '') {
   };
 
   // 构造文件名（点赞和日期放最前面）
-  let safeAuthor = (video.author || 'unknown').replace(/[\\/:*?"<>|]/g, '_');
-  if (safeAuthor.length > 50) safeAuthor = safeAuthor.substring(0, 50);
   const nameParts = [];
   if (video.likes) nameParts.push(video.likes);
   if (video.createTime) nameParts.push(video.createTime);
   if (language && !['未知语言', '未知', '拉丁语系（未识别）'].includes(language)) {
     nameParts.push(language);
   }
-  nameParts.push(safeAuthor);
-  let nameBody = nameParts.join('_');
-  if (!video.likes && !video.createTime) {
-    let safeTitle = (video.title || 'video').replace(/[\\/:*?"<>|]/g, '_');
-    if (safeTitle.length > 80) safeTitle = safeTitle.substring(0, 80);
-    nameBody = safeTitle;
-  }
+  nameParts.push(video.author || 'unknown');
+  // 标题片段始终参与命名：否则同作者同一天的多个视频会大量重名，
+  // 下载目录里出现一堆 xxx (1).mp4 无从辨认
+  const titleFrag = safeFileName(video.title, 40);
+  if (titleFrag) nameParts.push(titleFrag);
+  const nameBody = safeFileName(nameParts.filter(Boolean).join('_'), 120) || 'video';
   const filename = `${nameBody}.mp4`;
 
   // ---------- 单次下载（直连 URL 或代理 URL） ----------
@@ -1704,12 +2282,18 @@ async function downloadSingleVideo(video, language = '') {
       let downloadId;
       try {
         downloadId = await new Promise((resolve) => {
-          chrome.downloads.download({ url: dlUrl, filename, saveAs: false }, (id) => {
-            if (chrome.runtime.lastError) {
-              console.warn('[下载] 创建失败:', chrome.runtime.lastError.message);
-              resolve(null);
-            } else resolve(id);
-          });
+          let done = false;
+          const finish = (id) => { if (!done) { done = true; resolve(id); } };
+          try {
+            chrome.downloads.download({ url: dlUrl, filename, saveAs: false }, (id) => {
+              if (chrome.runtime.lastError) {
+                console.warn('[下载] 创建失败:', chrome.runtime.lastError.message);
+                finish(null);
+              } else finish(id);
+            });
+          } catch (e) { finish(null); }
+          // 兜底：API 回调若始终不触发，不能永久占死批量下载的并发槽位
+          setTimeout(() => finish(null), 15000);
         });
       } catch (e) {
         resolve({ success: false, error: 'API异常: ' + e.message, url: dlUrl });
@@ -1825,7 +2409,7 @@ async function downloadSingleVideo(video, language = '') {
 
   // 1) 先取新签名（仅对“原画质/页内拦截/自建后端/页面解析”等易过期来源执行，避免普通高清多等一轮）
   const isFreshNeeded = /原画质/.test(String(video.quality || ''))
-    || /intercept|universal|sigi|own_backend|fetch_|_page|page/i.test(String(video._parseSource || ''));
+    || isShortLivedSource(video);
   let freshUrl = '';
   let freshAltUrl = '';
   if (isFreshNeeded && video.originalUrl) {
@@ -1849,7 +2433,8 @@ async function downloadSingleVideo(video, language = '') {
   const candidates = [];
   const pushCand = (u) => {
     u = (u || '').trim();
-    if (!u || candidates.includes(u) || hlsCandidates.includes(u) || wmCandidates.includes(u)) return;
+    if (!u || !/^https?:\/\//i.test(u)) return; // 非 http(s) 地址一律丢弃
+    if (candidates.includes(u) || hlsCandidates.includes(u) || wmCandidates.includes(u)) return;
     if (/\.m3u8(\?|$)/i.test(u)) hlsCandidates.push(u);
     else if (looksWatermarked(u)) wmCandidates.push(u);
     else candidates.push(u);
@@ -1888,26 +2473,33 @@ async function downloadSingleVideo(video, language = '') {
   }
 
   // 4) 自建代理逐个尝试（服务器带 Cookie+Referer 拉流）。
-  //    A：先让代理 HEAD 探测候选是否真的可取流（200/206+视频类型），
-  //    探测不过的候选直接跳过，不发起注定失败的下载。
+  //    A：先用一次 1 字节的 Range 探测候选，明确是「过期签名错误页」才跳过；
+  //    其余情况（含代理自身报错）都交给真实下载验证——上游风控是间歇性的。
   let lastFail = null;
   let effortExhausted = false;
   for (const cand of candidates) {
     if (Date.now() - effortStart >= EFFORT_MS) { effortExhausted = true; break; }
     const proxyUrl = OWN_PROXY_API + encodeURIComponent(cand);
-    const probeOk = await probeProxyCandidate(proxyUrl);
-    if (probeOk === false) {
-      // 只有“明确是 200+错误页”才跳过；HEAD 403/无法判断(null)仍真实下载试一次
+    const probe = await probeProxyCandidate(proxyUrl);
+    if (probe === 'blocked') {
+      // 代理鉴权失败 / 已限流：换候选也是同样的结果，直接终止代理环节
+      lastFail = { success: false, error: '代理不可用（鉴权失败或已触发限流）' };
+      break;
+    }
+    if (probe === false) {
       console.log(`[下载] 代理探测确认为错误页，跳过候选: ${cand.slice(0, 90)}`);
       lastFail = { success: false, error: '该地址为过期/错误页' };
       continue;
     }
     console.log(`[下载] 代理尝试: ${cand.slice(0, 90)}`);
-    let r3 = await runDownload(proxyUrl);
-    // 探测通过但下载仍失败（Akamai 等间歇风控）：短等后重试一次
-    if (!r3.success) {
-      await sleep(1200);
+    // 上游取流是间歇性的（CDN 风控实测同一签名约 50% 波动），单次失败不足以
+    // 判定该候选不可用：重试 3 次并退避，比原来「失败一次就换候选」命中率高得多。
+    let r3 = { success: false, error: '未发起下载' };
+    for (let attempt = 1; attempt <= PROXY_DL_ATTEMPTS; attempt++) {
+      if (Date.now() - effortStart >= EFFORT_MS) { effortExhausted = true; break; }
       r3 = await runDownload(proxyUrl);
+      if (r3.success) break;
+      if (attempt < PROXY_DL_ATTEMPTS) await sleep(attempt === 1 ? 600 : 1500);
     }
     lastFail = r3;
     if (r3.success) {
@@ -1920,6 +2512,11 @@ async function downloadSingleVideo(video, language = '') {
   }
   // 到这里仍未成功：原画质视频累计一次失败（满 3 次后下次起自动带降级候选）
   if (isOrigQuality) recordOrigFail();
+
+  // 单条失败必须在控制台留痕：逐候选/逐次重试的日志默认关闭（VERBOSE_LOG），
+  // 但「到底试了几个候选、末次是什么错」是排查的唯一线索，必须无条件输出。
+  console.warn(`[下载失败] ${filename} | 直连 ${directCandidates.length} 个候选 / 代理 ${candidates.length} 个候选 ×${PROXY_DL_ATTEMPTS} 次 | 末次：${(lastFail && lastFail.error) || '未知'}` +
+    '（需要逐次明细请把 background.js 的 VERBOSE_LOG 改为 true）');
 
   return { ...(lastFail || { success: false, error: '下载失败' }), url, _gaveUp: effortExhausted };
 }
@@ -2163,8 +2760,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'stop-parse') {
-    // 停止当前解析：打标记 + 清空还没被 worker 领取的待解析项。
-    stopParseRequested = true;
+    // 停止当前解析：标记本批任务停止 + 清空还没被 worker 领取的待解析项。
+    if (parseTask) parseTask.stopped = true;
     parsePending = []; // 立即清空排队项
     if (parseTask?.status === 'running') {
       parseTask.stopped = true;
@@ -2254,15 +2851,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 查询 API 熔断状态
   if (message.type === 'get-api-cooldown') {
     const cooldownList = [];
-    for (const [url, until] of apiCooldownUntil) {
+    // apiCooldownUntil 的 key 现在就是 API 主机名
+    for (const [hostname, until] of apiCooldownUntil) {
       if (Date.now() < until) {
-        // 提取 API 域名，方便显示
-        try {
-          const hostname = new URL(url).hostname;
-          cooldownList.push({ url, hostname, cooldownUntil: until, remainingMs: until - Date.now() });
-        } catch (e) {
-          cooldownList.push({ url, hostname: url, cooldownUntil: until, remainingMs: until - Date.now() });
-        }
+        cooldownList.push({ url: hostname, hostname, cooldownUntil: until, remainingMs: until - Date.now() });
       }
     }
     sendResponse({ cooldown: cooldownList, total: cooldownList.length });
@@ -2273,16 +2865,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // 启动时清理旧的 running 状态（防止异常退出后一直显示解析中）
+// MV3 的 SW 被回收会打断正在跑的解析池：这里如实把状态收尾并提示用户，
+// 避免 UI 永远停在“解析中 N/M”。
+// 用同一个 Promise 去重并发调用：SW 启动时「顶层 IIFE」与 onStartup 会同时触发，
+// 不去重可能弹出两条相同通知。
+let _cleanupPromise = null;
+function cleanupInterruptedParse() {
+  if (_cleanupPromise) return _cleanupPromise;
+  _cleanupPromise = (async () => {
+    try {
+      const { parseProgress } = await chrome.storage.local.get('parseProgress');
+      if (parseProgress?.status === 'running') {
+        const done = parseProgress.success || 0;
+        // 未完成量：总数减去已成功、已跳过的部分，就是用户需要重新发起解析的条数
+        const pending = Math.max(0, (Number(parseProgress.total) || 0) - done - (Number(parseProgress.skipped) || 0));
+        parseProgress.status = 'done';
+        parseProgress.completedAt = Date.now();
+        parseProgress.queueLength = 0;
+        parseProgress.pending = 0;
+        await chrome.storage.local.set({ parseProgress });
+        console.warn(`[解析] 上次解析被后台回收中断（已成功 ${done} 项，剩余 ${pending} 项未完成），已保留已完成结果`);
+        showNotification({
+          type: 'basic', iconUrl: 'icons/icon128.png',
+          title: '⚠️ 上次解析被中断',
+          message: `后台被浏览器回收，已成功 ${done} 项并保留；剩余 ${pending} 项未完成，请重新发起解析。`
+        });
+      }
+    } catch (e) {}
+  })();
+  return _cleanupPromise;
+}
+
+// SW 每次启动都要做的状态对账
 (async () => {
-  try {
-    const { parseProgress } = await chrome.storage.local.get('parseProgress');
-    if (parseProgress?.status === 'running') {
-      parseProgress.status = 'done';
-      parseProgress.completedAt = Date.now();
-      parseProgress.queueLength = 0;
-      await chrome.storage.local.set({ parseProgress });
-    }
-  } catch (e) {}
+  await cleanupInterruptedParse();
+  await reconcileDownloadProgress();
 })();
 
-console.log('TikTok下载器 v3.4 后台已启动（拦截+主动抓取+深度解析+FetchHTML+下载进度+熔断+速度+历史+持久化+侧边栏+推荐页自动解析）');
+// 浏览器启动时的对账（onStartup 早于 SW 首次执行，单独挂一次）
+try {
+  chrome.runtime.onStartup.addListener(() => {
+    reconcileDownloadProgress();
+    cleanupInterruptedParse();
+  });
+} catch (e) {}
+
+console.log('TikTok下载器 v' + chrome.runtime.getManifest().version +
+  ' 后台已启动（拦截+主动抓取+深度解析+FetchHTML+下载进度+熔断+速度+历史+持久化+侧边栏+推荐页自动解析）');

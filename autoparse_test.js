@@ -12,7 +12,7 @@ const vm = require('vm');
 const TEST_URL = 'https://www.tiktok.com/@qaom9twgj8/video/7657172908623645969';
 const SEARCH_URL = 'https://www.tiktok.com/search?q=nose';
 const OTHER_URL = 'https://github.com/xzzz0371-maker/tiktok-downloader-v3';
-const VERSION = '4.5.0';
+const VERSION = '4.5.1';
 
 // ---------- mock 元素 ----------
 function makeEl(tag) {
@@ -185,14 +185,17 @@ async function runScenario(name, tabUrl, execResult, expectAuto) {
   const startMsg = sentMessages.find(m => m && m.type === 'start-parse');
 
   if (expectAuto) {
-    // 打开的具体视频页：自动填入并提交解析
+    // 打开的具体视频页：应提交解析，但【不写输入框】
     const expectUrl = (execResult || tabUrl || TEST_URL);
-    if (input === expectUrl) ok('输入框自动填入链接: ' + input.slice(0, 60));
-    else bad('输入框未填入链接，当前值: "' + input + '"');
+    // 【2026-09-24】自动解析不再往输入框塞链接：原实现每次追加一条，浏览越多
+    // 输入框积得越长、最后撑满界面。现改为把目标显式传给 handleParse，
+    // 断言点相应从"输入框被填入"改为"输入框不被污染"（链接是否提交看 start-parse）。
+    if (input === '') ok('自动解析未污染输入框（链接改走显式传参）');
+    else bad('输入框被自动解析写入: "' + input.slice(0, 80) + '"');
     if (startMsg && startMsg.urls && startMsg.urls.includes(expectUrl)) ok('已提交 start-parse（含链接）');
     else bad('未提交 start-parse，消息: ' + JSON.stringify(sentMessages));
-    if (els.urlInput.value === expectUrl) ok('提交后链接保留（未被清空）');
-    else bad('提交后链接被清空: "' + els.urlInput.value + '"');
+    if (els.urlInput.value === '') ok('提交后输入框仍为空（未被污染）');
+    else bad('提交后输入框被写入: "' + els.urlInput.value.slice(0, 80) + '"');
   } else {
     // 整页（搜索/首页等）或非 TikTok 页：不自动填入、不提交解析
     if (input === '') ok('未自动填入链接');

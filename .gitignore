@@ -1,0 +1,16 @@
+# ==== 内部工作数据（不应进公开仓库）====
+# .workbuddy/ 含项目记忆与会话笔记（账号、部署细节等内部信息）
+.workbuddy/
+
+# wrangler 部署缓存与本地状态
+.wrangler/
+web/.wrangler/
+
+# ==== 依赖与日志 ====
+node_modules/
+*.log
+
+# ==== 系统/编辑器 ====
+.DS_Store
+Thumbs.db
+desktop.ini

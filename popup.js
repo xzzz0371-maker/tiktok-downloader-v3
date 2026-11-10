@@ -189,7 +189,7 @@ function renderCard(video, index) {
       <div class="info">
         <button class="btn-delete-corner" data-del="${index}">✕</button>
         <div class="title" style="color:#ff3b30;">解析失败</div>
-        <div class="meta">${video.error || ''}</div>
+        <div class="meta">${escapeHtml(video.error)}</div>
       </div>
       <div class="actions"></div>
     `;
@@ -424,9 +424,17 @@ function updateDownloadedBadges() {
 // ---------- 删除 ----------
 async function deleteVideo(index) {
   if (index < 0 || index >= parsedVideos.length) return;
+  const removed = parsedVideos[index];
   parsedVideos.splice(index, 1);
   refreshVideoList(true);
-  await saveCache(parsedVideos);
+  // 按 id 从「最新缓存」中删除，而不是把内存里的整表写回：
+  // 内存列表可能落后于后台的增量写入，整表写回会把刚解析出的新视频一起覆盖掉。
+  try {
+    const latest = await loadCache();
+    await saveCache(latest.filter(v => v.id !== removed.id));
+  } catch (e) {
+    await saveCache(parsedVideos);
+  }
 }
 
 function updateToolbar() {
@@ -488,6 +496,14 @@ function handleDownload(index) {
   const video = parsedVideos[index];
   if (!video || !video.success) {
     showToast('视频信息无效');
+    return;
+  }
+
+  // 提前拦截无有效地址的条目，给出明确反馈而不是等后台返回失败
+  const hasVideoUrl = isHttpUrl(video.hdVideoUrl) || isHttpUrl(video.videoUrl);
+  const hasImages = Array.isArray(video.images) && video.images.some(isHttpUrl);
+  if (!hasVideoUrl && !hasImages) {
+    showToast('❌ 该条目没有有效的下载地址');
     return;
   }
 
@@ -590,11 +606,20 @@ async function restoreCache() {
 }
 
 // ---------- 预览 ----------
+// 只接受 http(s) 媒体地址：解析结果来自不可控第三方，防止把 javascript:/data: 之类
+// 交给 <video src>（预览与「新窗口打开」共用同一份地址）
+function isHttpUrl(u) {
+  return typeof u === 'string' && /^https?:\/\//i.test(u.trim());
+}
+
 function openPreview(index) {
   const v = parsedVideos[index];
   if (!v || !v.success) return;
   const url = v.hdVideoUrl || v.videoUrl;
-  if (!url) return;
+  if (!isHttpUrl(url)) {
+    showToast('❌ 视频地址无效，无法预览');
+    return;
+  }
   previewVideo.src = url;
   previewTitle.textContent = v.title;
   previewAuthor.textContent = v.author;
@@ -701,12 +726,34 @@ function detectBackground() {
 // ============================================================
 //  后台解析相关
 // ============================================================
+// 解析进度文案。展示「还没解析成功的数量」而不是「已处理数量」：
+// completed 会把失败项也算作已完成，进度条看着在涨、实际没有产出；
+// 用户真正关心的是"还剩多少条没拿到"。
+// pending 由后台按 total-success-skipped 计算，缺失时（旧版本后台）回退到 completed 口径。
+function formatParseProgress(progress) {
+  const total = Number(progress.total) || 0;
+  const pending = Number.isFinite(Number(progress.pending))
+    ? Number(progress.pending)
+    : Math.max(0, total - (Number(progress.completed) || 0));
+  // 夹紧到 [0, total]：并入新任务与收尾归零存在时序差，越界值会让文案自相矛盾
+  const left = Math.min(Math.max(0, pending), total);
+  const queueInfo = progress.queueLength > 0 ? `，队列等待 ${progress.queueLength} 个` : '';
+  // 成功数只在有产出时提示，且单独读 success 字段（不从 done 反推：
+  // done 里混了 skipped，反推会算出负数）
+  const success = Number(progress.success) || 0;
+  const okInfo = success > 0 ? `，已成功 ${success} 个` : '';
+  // 失败数只在「失败数明显多于剩余量」（即多为已放弃的重复项）时才单列，
+  // 否则它与「剩余未成功」是同一批数字的两种说法，并列显示只会让人困惑
+  const failed = Number(progress.failed) || 0;
+  const failInfo = failed > left ? `，其中失败 ${failed} 个` : '';
+  return `后台解析中：剩余 ${left}/${total} 条未成功${okInfo}${failInfo}${queueInfo}`;
+}
+
 async function checkParseProgress() {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: 'get-parse-progress' }, (progress) => {
       if (progress && progress.status === 'running') {
-        const queueInfo = progress.queueLength > 0 ? `，队列等待 ${progress.queueLength} 个` : '';
-        showStatus(`后台解析中 ${progress.completed}/${progress.total}${queueInfo}`);
+        showStatus(formatParseProgress(progress));
         parseBtn.disabled = true;
         parseBtn.style.opacity = '0.5';
         parseBtn.style.cursor = 'wait';
@@ -723,24 +770,51 @@ async function checkParseProgress() {
   });
 }
 
-async function handleParse(allowDuplicate = false, silent = false) {
-  const text = urlInput.value.trim();
-  if (!text) { if (!silent) showToast('请粘贴链接'); return; }
-  const urls = text.match(/https?:\/\/[^\s]+/g) || [];
-  const tiktokUrls = urls.filter(u => u.includes('tiktok.com') || u.includes('douyin.com'));
-  if (tiktokUrls.length === 0) { if (!silent) showToast('未找到有效链接'); return; }
+// 去重键归一化：优先用 videoId（视频的唯一标识，与 URL 形态无关）。
+// 只用完整 URL 比较会漏判——同一条视频的 URL 可能是：
+//   · 带 query 的分享链接（...&is_from_webapp=1）
+//   · 短链（vm.tiktok.com/xxx），解析后被展开成 /@user/video/<id>
+// 而解析结果里的 originalUrl 是「展开后」的形态，与输入框原文不相等。
+function dedupeKey(u) {
+  const s = String(u || '').trim();
+  const m = s.match(/\/(?:video|v|note)\/(\d+)/);
+  if (m) return 'id:' + m[1];
+  // 非视频详情页（主页/短链未展开）：退化为「去 query + 去尾斜杠」比较
+  return 'url:' + s.replace(/[?#].*$/, '').replace(/\/+$/, '');
+}
+
+// explicitUrls：由自动解析链路直接传入目标链接。此时【既不读、也不写输入框】——
+// 输入框是用户输入区，程序往里塞链接会不断累积。
+// 【2026-09-24 修复】原实现每次自动解析都把 URL 追加进输入框，
+// 浏览的视频越多、输入框积得越长，最后被撑满（用户看到的是一堆自己没粘过的链接）。
+async function handleParse(allowDuplicate = false, silent = false, explicitUrls = null) {
+  let tiktokUrls;
+  if (Array.isArray(explicitUrls) && explicitUrls.length) {
+    tiktokUrls = explicitUrls.slice();
+  } else {
+    const text = urlInput.value.trim();
+    if (!text) { if (!silent) showToast('请粘贴链接'); return; }
+    const urls = text.match(/https?:\/\/[^\s]+/g) || [];
+    tiktokUrls = urls.filter(u => u.includes('tiktok.com') || u.includes('douyin.com'));
+    if (tiktokUrls.length === 0) { if (!silent) showToast('未找到有效链接'); return; }
+  }
 
   // 过滤掉已经成功解析过的链接：输入框里通常保留着之前解析过的历史链接，
   // 如果不过滤，每次“解析一条新视频”都会把前面所有链接重新提交给后台再解析一遍。
-  const known = new Set(
-    parsedVideos
-      .filter(v => v.success && v.originalUrl)
-      .map(v => v.originalUrl.replace(/\/+$/, ''))
-  );
+  // 【2026-09-23 修复】原来用完整 URL 字符串比较，命中不了「形态不同但同一条视频」的
+  // 情况（带 query 的分享链接 / 短链展开后的差异）→ 已解析的链接被反复重复解析。
+  // 现改为 dedupeKey 归一化（优先 videoId），并额外用解析结果的 id 兜底，
+  // 确保「同一条视频」无论以什么 URL 形态出现都能命中。
+  const known = new Set();
+  for (const v of parsedVideos) {
+    if (!v || !v.success) continue;
+    if (v.id != null && v.id !== '') known.add('id:' + String(v.id));
+    if (v.originalUrl) known.add(dedupeKey(v.originalUrl));
+  }
   const seen = new Set();
   const freshUrls = [];
   for (const u of tiktokUrls) {
-    const key = u.replace(/\/+$/, '');
+    const key = dedupeKey(u);
     if (seen.has(key) || known.has(key)) continue;
     seen.add(key);
     freshUrls.push(u);
@@ -816,6 +890,11 @@ function setupEvents() {
   grabBtn.addEventListener('click', grabCurrentPageUrl);
   stopParseBtn.addEventListener('click', () => {
     chrome.runtime.sendMessage({ type: 'stop-parse' }, () => {
+      // 读取 lastError：后台未响应时给出明确提示，同时避免 "Unchecked runtime.lastError"
+      if (chrome.runtime.lastError) {
+        showToast('❌ 后台未响应：请在扩展管理页重新加载本扩展');
+        return;
+      }
       showToast('已停止解析');
     });
   });
@@ -826,6 +905,10 @@ function setupEvents() {
   recommendAutoParseToggle.addEventListener('change', () => {
     const enabled = recommendAutoParseToggle.checked;
     chrome.storage.local.set({ recommendAutoParse: enabled }, () => {
+      if (chrome.runtime.lastError) {
+        showToast('❌ 设置保存失败：' + chrome.runtime.lastError.message);
+        return;
+      }
       showToast(enabled ? '✅ 推荐页自动解析已开启' : '🔕 推荐页自动解析已关闭');
     });
   });
@@ -840,7 +923,7 @@ function setupEvents() {
   themeToggle.addEventListener('click', () => {
     const next = currentTheme === 'dark' ? 'light' : 'dark';
     applyTheme(next);
-    chrome.storage.local.set({ themePreference: next });
+    chrome.storage.local.set({ themePreference: next }).catch(() => {});
   });
 
   // 独立窗口按钮：打开一个不会自动关闭的独立窗口（限制只能开一个）
@@ -889,20 +972,30 @@ function setupEvents() {
     if (changes.parseProgress) {
       const progress = changes.parseProgress.newValue;
       if (progress?.status === 'running') {
-        const queueInfo = progress.queueLength > 0 ? `，队列等待 ${progress.queueLength} 个` : '';
-        showStatus(`后台解析中 ${progress.completed}/${progress.total}${queueInfo}`);
+        showStatus(formatParseProgress(progress));
         parseBtn.disabled = true;
         parseBtn.style.opacity = '0.5';
         parseBtn.style.cursor = 'wait';
         parseBtn.textContent = '解析中';
         stopParseBtn.style.display = '';
       } else if (progress?.status === 'done') {
-        hideStatus();
         parseBtn.disabled = false;
         parseBtn.style.opacity = '';
         parseBtn.style.cursor = '';
         parseBtn.textContent = '解析';
         stopParseBtn.style.display = 'none';
+        // 有失败时不能静默隐藏状态栏：用户只看到"没解析出来"却不知道为什么，
+        // 只能反复重试碰运气。这里把批次记录的具体原因直接展示出来
+        // （超时 / 落地被重定向 / 10204 —— 三者处理方式完全不同）。
+        const failedCount = Number(progress.failed) || 0;
+        const reasons = Array.isArray(progress.failedReasons) ? progress.failedReasons : [];
+        if (failedCount > 0) {
+          const uniq = [...new Set(reasons.map(r => String(r).split('｜')[0].trim()).filter(Boolean))];
+          const tail = uniq.length ? '：' + uniq[0].slice(0, 90) : '';
+          showStatus(`⚠️ ${failedCount} 条解析失败${tail}`, true);
+        } else {
+          hideStatus();
+        }
         loadCache().then(videos => {
           parsedVideos = videos || [];
           refreshVideoList();
@@ -1056,13 +1149,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             const isDetail = DETAIL_URL_RE.test(target);
             if (!isDetail && isAutoInCooldown(target)) continue;
             lastAutoParsedUrl = target;
-            // 追加而不是覆盖输入框：不弄丢用户已经粘贴/输入的其它链接
-            const lines = (urlInput.value || '').split('\n').map(s => s.trim()).filter(Boolean);
-            if (!lines.includes(target)) {
-              lines.push(target);
-              urlInput.value = lines.join('\n');
-            }
-            handleParse(false, true); // 解析中也提交，后台会排队（silent：重复目标时不打扰）
+            // 【2026-09-24 修复】不要往输入框里写 target：输入框是用户输入区，
+            // 原实现每次自动解析都追加一条，浏览越多输入框积得越长（界面被撑满、
+            // 且用户会看到一堆自己没粘贴过的链接）。改为直接把目标交给 handleParse，
+            // 输入框保持不动。
+            handleParse(false, true, [target]); // 解析中也提交，后台会排队（silent：重复目标时不打扰）
             if (!isDetail) markAutoCooldown(target);
             break;
           }

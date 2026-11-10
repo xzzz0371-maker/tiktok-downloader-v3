@@ -55,7 +55,9 @@ Prefer a quick online tool without installing the extension? Try the **web versi
 ## 🛠️ Technical Details
 
 - Built on Chrome **Manifest V3**
-- Uses a Service Worker as the background script with ES Module support
+- Uses a **classic (non-module) Service Worker** as the background script — deliberately no `type: "module"`, so it also loads on older Chromium-based browsers
+- Two-stage parse window: up to **5s** for the high-definition watermark-free fast sources, then up to **4s** for the original-quality fallback channel
+- Batch downloads run with **3 concurrent** downloads; batch parsing uses a 3-worker pool that widens to 8 for large batches
 - Permissions: `downloads`, `storage`, `tabs`, `scripting`, `contextMenus`, `notifications`, `webRequest`, `sidePanel`
 
 ## ⚠️ Disclaimer

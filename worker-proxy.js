@@ -25,6 +25,21 @@ function corsHeaders() {
   };
 }
 
+// IP 限流：每 IP 每分钟 40 次。
+// 单次下载只产生 1 个长连接请求，所以正常使用（含并发批量）不会接近该阈值；
+// 它的作用是避免本代理被当作无限额度的免费中转刷爆账号带宽。
+// 注意：本 Worker 未做鉴权（调用方未统一传 token），因此限流是当前唯一防线。
+const HITS_PER_MIN = 40;
+const ipHits = new Map();
+function rateLimited(ip) {
+  const now = Date.now();
+  const arr = (ipHits.get(ip) || []).filter(ts => now - ts < 60000);
+  if (arr.length >= HITS_PER_MIN) { ipHits.set(ip, arr); return true; }
+  arr.push(now);
+  ipHits.set(ip, arr);
+  return false;
+}
+
 function hostAllowed(host) {
   const h = String(host || '').toLowerCase();
   // TikTok webapp-prime CDN：v16-webapp-prime.tiktok.com 等（连字符结构，非子域名）
@@ -71,6 +86,12 @@ export default {
       return errorJson('method not allowed', 405);
     }
 
+    // IP 限流（防止被当作免费中转刷爆带宽配额）
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    if (rateLimited(ip)) {
+      return errorJson('rate limited', 429);
+    }
+
     const url = new URL(request.url);
     const target = url.searchParams.get('url');
     if (!target) return errorJson('missing url param', 400);
@@ -83,12 +104,15 @@ export default {
     }
 
     try {
-      const upstream = await fetchChecked(t.href, {
+      // 只在客户端确实带了 Range 时才转发；无条件设置 'Range': '' 会发出非法的空 Range 头
+      const reqHeaders = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
         'Referer': t.origin + '/',
-        'Accept': 'video/mp4, video/*;q=0.9, */*;q=0.8',
-        'Range': request.headers.get('Range') || ''
-      });
+        'Accept': 'video/mp4, video/*;q=0.9, */*;q=0.8'
+      };
+      const clientRange = request.headers.get('Range');
+      if (clientRange) reqHeaders['Range'] = clientRange;
+      const upstream = await fetchChecked(t.href, reqHeaders);
 
       // 只透传少量安全响应头；不透传 Set-Cookie / hop-by-hop 头
       const headers = new Headers(corsHeaders());
