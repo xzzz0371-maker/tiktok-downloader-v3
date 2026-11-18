@@ -122,8 +122,13 @@ console.log('=== 3. 功能链路（插件） ===');
     // 实际是当时的测试视频本身失效（oembed 200 但 ssstik 明确报 unavailable），
     // 把"视频不存在"误读成了"通道失效"。11-05 用有效视频复测：html 可稳定返回真实
     // playAddr（约 2s）。现把它与 ssstik、api 一起放在**第一段**竞速。
-    ['第一段竞速包含自研四端口（html/tkdl/ssstik/api）',
-      /for \(const ownMode of \['html', 'tkdl', 'ssstik', 'api'\]\)/.test(bg)],
+    ['第一段竞速包含自研四端口（tkdl/ssstik/html/api）',
+      /for \(const ownMode of \['tkdl', 'ssstik', 'html', 'api'\]\)/.test(bg)],
+    // 【2026-11-18】第一段不能"谁快用谁"：html 最快但返回的 prime CDN 地址
+    // 签名绑 tt_chain_token（匿名拿不到）→ 我们的代理必 403，
+    // 用户侧表现是「解析成功、下载报服务器错误」。必须优先可下载的源。
+    ['第一段按"可下载"优先而非速度', bg.includes('function racePreferDownloadable')],
+    ['tkdl/ssstik 被标为首选源', /PREFERRED_MODES = new Set\(\['tkdl', 'ssstik'\]\)/.test(bg)],
     // 第二段仍只跑"不用开页"的本地通道；服务端 mode 属于第一段，不得回插第二段
     ['第二段不再调用失效的服务端 html/item 源',
       !/origSources\.push\(parseViaOwnBackendMode\(finalUrl, '(html|item)'/.test(bg)],

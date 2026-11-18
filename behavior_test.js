@@ -938,6 +938,68 @@ const HEADERS = { Referer: 'https://www.tiktok.com/', Accept: 'video/mp4' };
     okc('空/未定义不抛错', d(null) === '未知错误' && d(undefined) === '未知错误');
   }
 
+  // ---------- 17. racePreferDownloadable：优先「下得动」而不是「最快」 ----------
+  // 回归背景（2026-11-18，老板截图「解析21个、下载全报服务器错误」）：
+  // html 通道最快，靠 Promise.any 永远赢，但它给的 prime CDN 地址
+  // 签名绑 tt_chain_token（匿名拿不到）→ 代理必 403 → 用户看到服务器错误。
+  console.log('\n=== 17. racePreferDownloadable（可下载优先） ===');
+  {
+    const seg = extract(bg, 'function describeError', 'async function parseVideo');
+    const ctx = { setTimeout, clearTimeout };
+    vm.createContext(ctx);
+    vm.runInContext(seg, ctx);
+    const race = ctx.racePreferDownloadable;
+    const WAIT = 200;
+    const delay = (ms, v, ok = true) => new Promise((res, rej) =>
+      setTimeout(() => ok ? res(v) : rej(v), ms));
+
+    // ① 非首选（html）先到、首选（tkdl）后到 → 必须用首选
+    {
+      const t0 = Date.now();
+      const r = await race([
+        { preferred: true, p: delay(60, { id: 'tkdl' }) },
+        { preferred: false, p: delay(10, { id: 'html' }) },
+      ], WAIT);
+      okc('首选源胜出（即使它更慢）', r.id === 'tkdl', r.id);
+      okc('  未把更快的 html 直接返回', r.id !== 'html');
+    }
+
+    // ② 首选全部失败 → 立刻用兜底，不等满 waitMs
+    {
+      const t0 = Date.now();
+      const r = await race([
+        { preferred: true, p: delay(30, new Error('tkdl down'), false) },
+        { preferred: false, p: delay(5, { id: 'html' }) },
+      ], WAIT);
+      const cost = Date.now() - t0;
+      okc('首选失败后返回兜底结果', r.id === 'html', r.id);
+      okc('  不空等到 waitMs', cost < WAIT, cost + 'ms');
+    }
+
+    // ③ 首选既不成功也不失败（挂住）→ waitMs 后仍要交出兜底，不能丢
+    {
+      const r = await race([
+        { preferred: true, p: new Promise(() => {}) },
+        { preferred: false, p: delay(5, { id: 'html' }) },
+      ], WAIT);
+      okc('首选挂住时仍返回兜底结果', r.id === 'html', r.id);
+    }
+
+    // ④ 全失败 → 拒绝，且原因可读（不是 All promises were rejected）
+    {
+      let msg = '';
+      try {
+        await race([
+          { preferred: true, p: delay(5, new Error('tkdl: no download link'), false) },
+          { preferred: false, p: delay(5, new Error('backend HTML 403'), false) },
+        ], WAIT);
+      } catch (e) { msg = e.message; }
+      okc('全失败时拒绝', msg.length > 0, msg);
+      okc('  原因展开到各源', msg.includes('tkdl') || msg.includes('403'), msg);
+      okc('  不含 All promises were rejected', !msg.includes('All promises were rejected'), msg);
+    }
+  }
+
   console.log(`\n========== 结果: ${pass} 通过 / ${fail} 失败 ==========`);
   process.exit(fail > 0 ? 1 : 0);
 })();

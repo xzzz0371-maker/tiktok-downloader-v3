@@ -1503,6 +1503,66 @@ function describeError(e) {
   return String((e && e.message) || e || '未知错误');
 }
 
+// 竞速时区分「解析得到」和「**下得动**」，两者不是一回事。
+//
+// 【2026-11-18 根因】html 通道最快（~1.5s），靠 Promise.any 永远赢；
+// 但它返回的是 `*-webapp-prime.tiktok.com` 地址，签名查询串里带
+// `tk=tt_chain_token` —— 该 Cookie 匿名拿不到（首页与视频页都只下发
+// ttwid + tt_csrf_token），所以我们的代理去取必定 403（重试 8 次全败），
+// 用户看到的就是「服务器错误」。
+// 而 tkdl / ssstik 返回的是第三方自己的代理直链（snapcdn / tikcdn），
+// 我们的代理能正常取到字节。
+//
+// 因此：**首选可下载的源**，html 降级为兜底；并给它一个宽限窗口，
+// 免得它靠速度把后面能用的结果挤掉。
+function racePreferDownloadable(entries, waitMs) {
+  const preferred = entries.filter(e => e.preferred);
+  const others = entries.filter(e => !e.preferred);
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let held = null;
+    let prefPending = preferred.length;
+    let otherPending = others.length;
+    const errs = [];
+    let timer = null;
+
+    const settle = (fn, v) => {
+      if (done) return;
+      done = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      fn(v);
+    };
+    const finish = (v) => settle(resolve, v);
+    const bail = () => {
+      if (done) return;
+      if (held) return finish(held);
+      if (prefPending === 0 && otherPending === 0) {
+        settle(reject, new Error(describeError({ errors: errs })));
+      }
+    };
+
+    // 首选源若迟迟不返回（最长等到 waitMs），仍要把兜底结果交出去，
+    // 否则外层超时会先触发，连已经拿到的 html 结果一起丢掉。
+    timer = setTimeout(() => { if (held) finish(held); }, waitMs);
+
+    preferred.forEach(e => e.p.then(r => finish(r)).catch(err => {
+      errs.push(err);
+      prefPending--;
+      bail();
+    }));
+    others.forEach(e => e.p.then(r => {
+      if (!held) held = r;
+      otherPending--;
+      // 首选源全部失败时，立刻交兜底结果，不再空等
+      if (prefPending === 0) finish(held);
+    }).catch(err => {
+      errs.push(err);
+      otherPending--;
+      bail();
+    }));
+  });
+}
+
 async function parseVideo(url, opts = {}) {
   let finalUrl = url.trim();
 
@@ -1549,34 +1609,37 @@ async function parseVideo(url, opts = {}) {
     return r;
   };
 
-  // ===== 第一段（最多 5 秒）：“高清无水印”快源优先 =====
-  // 【2026-11-05 修正】此前只跑自建 `api` 一个 mode，而 `api`（第三方源池）长期全灭，
-  // 导致第一段每条视频白等满 5 秒、零产出，"有时解析不出来"由此而来。
-  // 实测发现被 09-17 误判为"已死"的 `html`（页面直抓）其实是**可用**的——
-  // 当时用的是失效视频做测试，把"视频不存在"误读成"通道失效"。
-  // 现在四个自研端口一起竞速（Promise.any 谁先成功用谁）：
-  //   html   ≈1.5s 页面直抓，返回真实 playAddr（主力）
-  //   tkdl   ≈1.1s tikdownloader/tikvid，给 snapcdn 直链，**有 HD 档**且实测不限流
-  //   ssstik ≈1.5s 第三方兑换直链（会限流，仅作补充）
-  //   api    兜底，第三方源池（多数已死，失败不影响其他三个）
+  // ===== 第一段（最多 5 秒）：优先「下得动」的源 =====
+  // 四个自研端口并行，但**不再谁快用谁**：
+  //   tkdl   ≈3.5s tikdownloader/tikvid → snapcdn 直链，我们的代理能取到字节【首选】
+  //   ssstik ≈2s   ssstik.io             → tikcdn 直链，同样能取【首选，但会限流】
+  //   html   ≈1.5s 页面直抓              → prime CDN，签名绑 tt_chain_token，
+  //                                        匿名拿不到 Cookie → 代理必 403【仅兜底】
+  //   api    第三方源池，长期全灭【兜底】
+  // 详见 racePreferDownloadable 的注释。
   const stage1Abort = new AbortController();
+  const PREFERRED_MODES = new Set(['tkdl', 'ssstik']);
   const fastHdSources = [];
-  for (const ownMode of ['html', 'tkdl', 'ssstik', 'api']) {
-    fastHdSources.push(
-      parseViaOwnBackendMode(finalUrl, ownMode, PARSE_FAST_HD_MS, stage1Abort.signal)
+  for (const ownMode of ['tkdl', 'ssstik', 'html', 'api']) {
+    fastHdSources.push({
+      preferred: PREFERRED_MODES.has(ownMode),
+      p: parseViaOwnBackendMode(finalUrl, ownMode, PARSE_FAST_HD_MS, stage1Abort.signal)
         .then(finalize).catch(e => { throw e; })
-    );
+    });
   }
   for (const api of availableApis) {
-    fastHdSources.push(fetchAndParse(api, PARSE_FAST_HD_MS, stage1Abort.signal).then(r => {
-      r._parseSource = 'third_party';
-      return finalize(r);
-    }).catch(e => { throw e; }));
+    fastHdSources.push({
+      preferred: false,
+      p: fetchAndParse(api, PARSE_FAST_HD_MS, stage1Abort.signal).then(r => {
+        r._parseSource = 'third_party';
+        return finalize(r);
+      }).catch(e => { throw e; })
+    });
   }
   let rFast = null;
   try {
     rFast = await Promise.race([
-      Promise.any(fastHdSources),
+      racePreferDownloadable(fastHdSources, PARSE_FAST_HD_MS - 300),
       timeoutOf(PARSE_FAST_HD_MS, '高清无水印快源超时')
     ]);
   } catch (e) {
