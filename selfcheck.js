@@ -229,6 +229,10 @@ console.log('=== 3. 功能链路（插件） ===');
     ['重试耗尽仍保留原因', bg.includes("return { success: false, error: lastError || '解析失败（无详情）' }")],
     ['批次记录失败原因', bg.includes('const failedReasons = [];') && bg.includes('const pushFail = (u, reason) =>')],
     ['失败原因落库供 UI 读取', bg.includes('task.failedReasons = failedReasons.slice(0, 20)')],
+    // 【2026-11-18】Promise.any 全败时抛 AggregateError，.message 恒为
+    // "All promises were rejected"，各源原因在 .errors 里 —— 必须展开，
+    // 否则失败原因没有信息量。
+    ['失败原因展开聚合错误', bg.includes('function describeError') && bg.includes("failReasons.push('高清段:' + describeError(e))")],
   ];
   for (const [name, v] of checks) v ? ok('background: ' + name) : bad('background: ' + name);
   const popup = fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8');

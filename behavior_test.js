@@ -912,6 +912,32 @@ const HEADERS = { Referer: 'https://www.tiktok.com/', Accept: 'video/mp4' };
     }
   }
 
+  // ---------- 16. describeError：AggregateError 必须展开 ----------
+  // 回归背景（2026-11-18）：第一段用 Promise.any 竞速，全部失败时抛 AggregateError，
+  // 其 .message 恒为 "All promises were rejected"，各源真实原因在 .errors 里。
+  // 原来直接取 e.message → 用户看到的失败原因毫无信息量，排查只能靠猜。
+  console.log('\n=== 16. describeError（聚合错误展开） ===');
+  {
+    const seg = extract(bg, 'function describeError', 'async function parseVideo');
+    const ctx = {};
+    vm.createContext(ctx);
+    vm.runInContext(seg, ctx);
+    const d = ctx.describeError;
+
+    const agg = { name: 'AggregateError', message: 'All promises were rejected',
+                  errors: [new Error('backend HTML 403'), new Error('tkdl: no download link'), new Error('ssstik: video unavailable')] };
+    const out = d(agg);
+    okc('展开出各源原因', out.includes('backend HTML 403') && out.includes('tkdl:'), out);
+    okc('不再输出 All promises were rejected', !out.includes('All promises were rejected'), out);
+    okc('最多保留 3 条', String(out).split(' / ').length <= 3, out);
+
+    okc('普通 Error 原样返回', d(new Error('single failure')) === 'single failure', d(new Error('x')));
+    okc('重复原因去重',
+      d({ errors: [new Error('same'), new Error('same')], message: 'x' }) === 'same',
+      d({ errors: [new Error('same'), new Error('same')], message: 'x' }));
+    okc('空/未定义不抛错', d(null) === '未知错误' && d(undefined) === '未知错误');
+  }
+
   console.log(`\n========== 结果: ${pass} 通过 / ${fail} 失败 ==========`);
   process.exit(fail > 0 ? 1 : 0);
 })();

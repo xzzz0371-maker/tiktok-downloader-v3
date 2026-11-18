@@ -1488,6 +1488,21 @@ function looksWatermarked(rawUrl) {
       || /\/watermark\/|watermark\/1|_wm\.mp4/i.test(u);
 }
 
+// 把 Promise.any 的拒因展开成可读文本。
+// Promise.any 全部失败时抛的是 AggregateError，`.message` 只有一句
+// "All promises were rejected"——真正的每个源的原因都在 `.errors` 里。
+// 不展开的话，用户看到的失败原因等于没说，排查全靠猜。
+function describeError(e) {
+  if (e && Array.isArray(e.errors) && e.errors.length) {
+    const parts = e.errors
+      .map(x => String((x && x.message) || x || '').trim())
+      .filter(Boolean);
+    const uniq = [...new Set(parts)];
+    if (uniq.length) return uniq.slice(0, 3).join(' / ');
+  }
+  return String((e && e.message) || e || '未知错误');
+}
+
 async function parseVideo(url, opts = {}) {
   let finalUrl = url.trim();
 
@@ -1566,7 +1581,7 @@ async function parseVideo(url, opts = {}) {
     ]);
   } catch (e) {
     console.log('[解析] 第一段高清无水印未命中（' + PARSE_FAST_HD_MS + 'ms），切本地通道:', e.message);
-    failReasons.push('高清段:' + (e.message || e));
+    failReasons.push('高清段:' + describeError(e));
   } finally {
     stage1Abort.abort();
   }
@@ -1602,7 +1617,7 @@ async function parseVideo(url, opts = {}) {
     ]);
   } catch (e) {
     console.log('[解析] 本地通道未命中（' + PARSE_ORIG_MS + 'ms）:', e.message);
-    failReasons.push('本地:' + (e.message || e));
+    failReasons.push('本地:' + describeError(e));
   } finally {
     stage2Abort.abort();
   }
@@ -1618,7 +1633,7 @@ async function parseVideo(url, opts = {}) {
     if (fin?.success) return fin;
   } catch (e) {
     console.log('[解析] 静默标签页未命中:', e.message);
-    failReasons.push('静默:' + (e.message || e));
+    failReasons.push('静默:' + describeError(e));
   }
 
   return {
