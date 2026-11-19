@@ -31,6 +31,9 @@ const API_TIMEOUT = 10000;
 // 拿不到再跑“本地通道”(拦截缓存 / 页面深挖 / FetchHTML)最多 4 秒——走浏览器自身出口，
 // 不受服务端数据中心 IP 风控影响。
 const PARSE_FAST_HD_MS = 5000;
+// tkdl 单独重试的窗口：它本身要 3.5~4.4s，第一段 5s 窗口在批量并发时经常切掉它。
+// 只有在「html 赢了但地址是 prime（下不动）」时才走这次重试，属兜底性质。
+const TKDL_RETRY_MS = 12000;
 const PARSE_ORIG_MS = 4000;
 // 下载候选“首次无进展”判定：30 秒内没有任何字节进展才取消该候选，随后继续下一候选/重试。
 // 只要下载一直在走字节，观察会不断顺延（见 runDownload 的 checkTimeout），不会误杀大文件。
@@ -1503,6 +1506,15 @@ function describeError(e) {
   return String((e && e.message) || e || '未知错误');
 }
 
+// prime CDN 地址对我们的代理**必然 403**。
+// 签名查询串里带 `tk=tt_chain_token`，而该 Cookie 由 TikTok 的 JS（webmssdk）在
+// 运行时写入 —— 实测抓到的页面 HTML 里 `tt_chain_token` / `ttwid` / `msToken` 出现 0 次，
+// 不执行 JS 就拿不到。所以服务端签发的 prime 地址只能用于**读取元数据**，
+// 不能用来下载。识别出来，别让它变成一张"点不动的卡片"。
+function isPrimeCdnUrl(rawUrl) {
+  return /webapp-prime\.tiktok\.com/i.test(String(rawUrl || ''));
+}
+
 // 竞速时区分「解析得到」和「**下得动**」，两者不是一回事。
 //
 // 【2026-11-18 根因】html 通道最快（~1.5s），靠 Promise.any 永远赢；
@@ -1648,7 +1660,28 @@ async function parseVideo(url, opts = {}) {
   } finally {
     stage1Abort.abort();
   }
-  if (rFast?.success) return rFast;
+  if (rFast?.success) {
+    // 地址不是 prime → 能正常下载，直接用。
+    if (!isPrimeCdnUrl(rFast.hdVideoUrl || rFast.videoUrl)) return rFast;
+
+    // 走到这里说明 html 赢了，但它给的 prime 地址下不动（见 isPrimeCdnUrl 注释）。
+    // tkdl 在第一段常被 5 秒窗口切掉（它本身要 3.5~4.4 秒，批量并发时更慢），
+    // 所以这里用**更长的窗口**给它一次独立重试 —— 它成功就意味着拿到可下载地址。
+    try {
+      const retry = await parseViaOwnBackendMode(finalUrl, 'tkdl', TKDL_RETRY_MS);
+      if (retry?.success) {
+        const fin = finalize(retry);
+        if (fin?.success && !isPrimeCdnUrl(fin.hdVideoUrl || fin.videoUrl)) return fin;
+      }
+    } catch (e) {
+      failReasons.push('tkdl重试:' + describeError(e));
+    }
+
+    // 重试也没拿到：交回 prime 结果（元数据完整），并标记需登录态，
+    // 让下载层给出明确提示而不是 SERVER_FAILED。
+    rFast._needsLogin = true;
+    return rFast;
+  }
 
   // ===== 第二段 A（最多 4 秒）：已在手的本地通道 =====
   // 「本地拦截 / 页面深挖 / FetchHTML」——走浏览器自身的登录态与出口 IP，
@@ -2307,12 +2340,30 @@ const SHORT_LIVED_SOURCES = new Set([
   'script_field',    // parseViaPageDeep: <script> 内字段
   'script_regex',    // parseViaPageDeep: <script> 内 URL
 ]);
+// 是否来自用户浏览器自身的会话（拦截 / 静默页）。
+// 只有这类地址带着用户真实的登录态（含 JS 写入的 tt_chain_token），
+// prime CDN 才有下载可能；服务端签发的地址没这个前提。
+const BROWSER_CAPTURED_SOURCES = new Set(['intercept', 'silent_tab']);
+function isBrowserCapturedSource(video) {
+  const src = String((video && video._parseSource) || '').trim().toLowerCase();
+  return BROWSER_CAPTURED_SOURCES.has(src);
+}
+
 function isShortLivedSource(video) {
   const src = String((video && video._parseSource) || '').trim().toLowerCase();
   if (!src) return false;
   if (SHORT_LIVED_SOURCES.has(src)) return true;
   // 前缀兜底：源名可能带后缀（如 own_backend_api），按明确前缀匹配，不再吞掉 fetch_next
   return /^(?:intercept|silent_tab|own_backend|page)(?:[_\-].*)?$/.test(src);
+}
+
+// 判断某个地址是不是「注定下载不了」，返回给用户的原因（空串 = 可以尝试）。
+// 抽成纯函数：downloadSingleVideo 依赖太多，直接断言不方便。
+function primeDownloadBlockReason(video, url) {
+  if (!isPrimeCdnUrl(url)) return '';
+  if (!video || !video._needsLogin) return '';
+  if (isBrowserCapturedSource(video)) return '';
+  return '该地址需登录态（服务端签发），暂不支持下载；请打开该视频页再点「当前页」解析';
 }
 
 async function downloadSingleVideo(video, language = '') {
@@ -2325,6 +2376,12 @@ async function downloadSingleVideo(video, language = '') {
     return downloadPhotoImages(video, language);
   }
   if (!url) return { success: false, error: '无视频链接', url: null };
+
+  // 服务端签发的 prime 地址必失败：签名绑 tt_chain_token（JS 运行时才有），
+  // 直连没有该 Cookie、代理也取不到 → Chrome 只会报 SERVER_FAILED。
+  // 与其让用户白等一轮代理重试，不如直接说清楚。
+  const blockReason = primeDownloadBlockReason(video, url);
+  if (blockReason) return { success: false, error: blockReason, url: null };
 
   // “原画质(无水印)”判定：失败满 3 次后允许自动降级到高清/带水印地址下载
   const isOrigQuality = /原画质/.test(String(video.quality || '')) || isShortLivedSource(video);

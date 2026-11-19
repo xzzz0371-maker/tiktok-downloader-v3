@@ -129,6 +129,15 @@ console.log('=== 3. 功能链路（插件） ===');
     // 用户侧表现是「解析成功、下载报服务器错误」。必须优先可下载的源。
     ['第一段按"可下载"优先而非速度', bg.includes('function racePreferDownloadable')],
     ['tkdl/ssstik 被标为首选源', /PREFERRED_MODES = new Set\(\['tkdl', 'ssstik'\]\)/.test(bg)],
+    // 【2026-11-19】prime 地址必 403（签名绑 tt_chain_token，JS 运行时才有），
+    // 既不能当最终结果，也不能让用户点一个注定失败的下载按钮。
+    ['识别 prime 不可下载地址', bg.includes('function isPrimeCdnUrl')],
+    ['prime 结果触发 tkdl 长窗口重试',
+      bg.includes('TKDL_RETRY_MS') && bg.includes("parseViaOwnBackendMode(finalUrl, 'tkdl', TKDL_RETRY_MS)")],
+    ['下载层对 prime 地址给出明确提示',
+      bg.includes('function primeDownloadBlockReason') && bg.includes('const blockReason = primeDownloadBlockReason(video, url)')],
+    ['浏览器会话地址不受该限制',
+      bg.includes('function isBrowserCapturedSource') && bg.includes('BROWSER_CAPTURED_SOURCES')],
     // 第二段仍只跑"不用开页"的本地通道；服务端 mode 属于第一段，不得回插第二段
     ['第二段不再调用失效的服务端 html/item 源',
       !/origSources\.push\(parseViaOwnBackendMode\(finalUrl, '(html|item)'/.test(bg)],

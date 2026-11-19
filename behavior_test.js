@@ -1000,6 +1000,53 @@ const HEADERS = { Referer: 'https://www.tiktok.com/', Accept: 'video/mp4' };
     }
   }
 
+  // ---------- 18. prime CDN 识别：别产出「点不动的卡片」 ----------
+  // 回归背景（2026-11-19）：「每次原画质就下载失败」。
+  // prime 地址的签名绑 tt_chain_token，该 Cookie 由 TikTok 的 JS 运行时写入，
+  // 实测页面 HTML 里 0 次出现 → 服务端拿不到 → 我们的代理必 403。
+  console.log('\n=== 18. prime CDN 识别（不可下载地址） ===');
+  {
+    const seg = extract(bg, 'function isPrimeCdnUrl', 'async function parseVideo');
+    const ctx = { setTimeout, clearTimeout };
+    vm.createContext(ctx);
+    vm.runInContext(seg, ctx);
+    const isPrime = ctx.isPrimeCdnUrl;
+
+    okc('识别 prime 地址', isPrime('https://v16-webapp-prime.tiktok.com/video/tos/x?a=1') === true);
+    okc('  也识别 v19 变体', isPrime('https://v19-webapp-prime.tiktok.com/x') === true);
+    okc('普通 CDN 不误判', isPrime('https://v16-webapp.tiktokcdn.com/x.mp4') === false);
+    okc('tkdl 直链不误判', isPrime('https://dl.snapcdn.app/get?token=x') === false);
+    okc('空值不抛错', isPrime('') === false && isPrime(null) === false);
+
+    // 下载层拦截判定（纯函数，可独立断言）
+    const seg3 = extract(bg, 'function primeDownloadBlockReason', 'async function downloadSingleVideo');
+    const ctx3 = {};
+    vm.createContext(ctx3);
+    vm.runInContext(extract(bg, 'function isPrimeCdnUrl', 'function racePreferDownloadable'), ctx3);
+    vm.runInContext(extract(bg, 'const BROWSER_CAPTURED_SOURCES', 'function isShortLivedSource'), ctx3);
+    vm.runInContext(seg3, ctx3);
+    const reason = ctx3.primeDownloadBlockReason;
+    const PRIME = 'https://v16-webapp-prime.tiktok.com/video/tos/x?a=1';
+
+    okc('服务端 prime 地址被拦下', reason({ _needsLogin: true, _parseSource: 'own_backend' }, PRIME).length > 0);
+    okc('  提示文案说清原因', /登录态/.test(reason({ _needsLogin: true }, PRIME)));
+    okc('静默页抓的 prime 地址放行', reason({ _needsLogin: true, _parseSource: 'silent_tab' }, PRIME) === '');
+    okc('拦截抓的 prime 地址放行', reason({ _needsLogin: true, _parseSource: 'intercept' }, PRIME) === '');
+    okc('未标记需登录态时不拦', reason({}, PRIME) === '');
+    okc('非 prime 地址不拦', reason({ _needsLogin: true }, 'https://dl.snapcdn.app/get?token=x') === '');
+
+    // 来源判定：只有用户浏览器自己抓到的地址才可能带登录态
+    const seg2 = extract(bg, 'const BROWSER_CAPTURED_SOURCES', 'async function downloadSingleVideo');
+    const ctx2 = {};
+    vm.createContext(ctx2);
+    vm.runInContext(seg2, ctx2);
+    const isBrowser = ctx2.isBrowserCapturedSource;
+    okc('静默页结果算浏览器会话', isBrowser({ _parseSource: 'silent_tab' }) === true);
+    okc('拦截结果算浏览器会话', isBrowser({ _parseSource: 'intercept' }) === true);
+    okc('服务端结果不算', isBrowser({ _parseSource: 'own_backend' }) === false);
+    okc('  空来源不算', isBrowser({}) === false && isBrowser(null) === false);
+  }
+
   console.log(`\n========== 结果: ${pass} 通过 / ${fail} 失败 ==========`);
   process.exit(fail > 0 ? 1 : 0);
 })();
