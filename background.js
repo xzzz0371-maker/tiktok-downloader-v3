@@ -1143,13 +1143,21 @@ function recordApiSuccess(apiUrl) {
   apiCooldownUntil.delete(key);
 }
 
+// 首选源（tkdl/ssstik）是唯一能下动的通道，冷却代价极大：
+// 一旦冷掉，整批结果都会退回 html 的 prime 地址（下不动）→ 用户看到"全变原画质"。
+// 所以给它们更短的冷却窗口，宁可多试几次，也不要长时间失去这条通道。
+function cooldownMsFor(key) {
+  return /#(tkdl|ssstik)$/.test(String(key || '')) ? 60 * 1000 : API_COOLDOWN_MS;
+}
+
 function recordApiFailure(apiUrl) {
   const key = apiKey(apiUrl);
   const count = (apiFailureCount.get(key) || 0) + 1;
   apiFailureCount.set(key, count);
   if (count >= API_MAX_FAILURE) {
-    apiCooldownUntil.set(key, Date.now() + API_COOLDOWN_MS);
-    console.warn(`[熔断] API ${key} 连续失败${count}次，冷却5分钟`);
+    const ms = cooldownMsFor(key);
+    apiCooldownUntil.set(key, Date.now() + ms);
+    console.warn(`[熔断] API ${key} 连续失败${count}次，冷却${Math.round(ms / 1000)}秒`);
   }
 }
 
@@ -1474,9 +1482,21 @@ async function parseViaOwnBackendMode(finalUrl, mode, timeoutMs = 6000, signal =
     // 不能计入熔断（否则一次成功解析就会把其余源误判为故障、直接冷掉）。
     // 同理，调用方 abort 造成的取消也不应记失败。
     const aborted = e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')));
-    if (!aborted) recordApiFailure(fuseKey);
+    // 【2026-11-20】只记「通道故障」，不记「这条视频取不到」。
+    // 原来任何异常都计数：tkdl 在 3 条视频上取不到 → 冷却 5 分钟 →
+    // 期间所有解析都退回 html → 结果全变成「原画质」（而原画质又下不动），
+    // 表现就是「刚才还高清，突然全是原画质」。
+    // 视频级失败说明不了通道健康度，必须排除。
+    if (!aborted && !isVideoSpecificFailure(e)) recordApiFailure(fuseKey);
     throw e;
   }
+}
+
+// 区分「这条视频本身取不到」和「通道坏了」。
+// 前者不该触发熔断——否则会被一批无解视频打成全局冷却。
+function isVideoSpecificFailure(e) {
+  const m = String((e && e.message) || e || '');
+  return /no download link|not playable|video unavailable|not a result page|no video data|10204|item doesn't exist|no link|empty response/i.test(m);
 }
 
 // 判定一个媒体 URL 是否“明显带水印”（playwm / watermark=1 / /watermark/ 等）。

@@ -138,6 +138,12 @@ console.log('=== 3. 功能链路（插件） ===');
       bg.includes('function primeDownloadBlockReason') && bg.includes('const blockReason = primeDownloadBlockReason(video, url)')],
     ['浏览器会话地址不受该限制',
       bg.includes('function isBrowserCapturedSource') && bg.includes('BROWSER_CAPTURED_SOURCES')],
+    // 【2026-11-20】熔断不能把「这条视频取不到」当成「通道故障」：
+    // 否则 3 条无解视频就把 tkdl 冷掉 5 分钟，期间结果全退回 html 的 prime 地址
+    // → 用户看到「刚才还高清，突然全变原画质」。
+    ['视频级失败不触发熔断',
+      bg.includes('function isVideoSpecificFailure') && bg.includes('!isVideoSpecificFailure(e)')],
+    ['首选源冷却时间更短', bg.includes('function cooldownMsFor') && bg.includes('#(tkdl|ssstik)$')],
     // 第二段仍只跑"不用开页"的本地通道；服务端 mode 属于第一段，不得回插第二段
     ['第二段不再调用失效的服务端 html/item 源',
       !/origSources\.push\(parseViaOwnBackendMode\(finalUrl, '(html|item)'/.test(bg)],
@@ -160,7 +166,7 @@ console.log('=== 3. 功能链路（插件） ===');
     })()],
     // 自建后端必须接入熔断：否则长期全灭的源会让每条视频白等满窗口
     ['自建后端接入熔断', bg.includes('const fuseKey = OWN_PARSE_API') && bg.includes('isApiInCooldown(fuseKey)')],
-    ['熔断不误伤主动取消', bg.includes('if (!aborted) recordApiFailure(fuseKey)')],
+    ['熔断不误伤主动取消', bg.includes('if (!aborted && !isVideoSpecificFailure(e)) recordApiFailure(fuseKey)')],
     // 标签页泄漏是这条通道最危险的失效模式：长批量下会开出成百上千个后台页，
     // 因此关闭动作写在 finally 里（单一出口），不能分散在各 catch 分支。
     ['静默标签页必关（finally 单一出口）',

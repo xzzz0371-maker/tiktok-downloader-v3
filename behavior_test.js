@@ -1047,6 +1047,38 @@ const HEADERS = { Referer: 'https://www.tiktok.com/', Accept: 'video/mp4' };
     okc('  空来源不算', isBrowser({}) === false && isBrowser(null) === false);
   }
 
+  // ---------- 19. 熔断只记「通道故障」，不记「这条视频取不到」 ----------
+  // 回归背景（2026-11-20，老板「为啥又解析的是原视频了，刚刚还正常高清」）：
+  // tkdl 在 3 条视频上取不到 → 触发熔断冷却 5 分钟 →
+  // 期间所有解析退回 html → 结果全是「原画质」（且原画质下不动）。
+  // 视频级失败说明不了通道健康度，必须排除。
+  console.log('\n=== 19. 熔断判定（视频级失败不冷却） ===');
+  {
+    const seg = extract(bg, 'function isVideoSpecificFailure', 'function looksWatermarked');
+    const ctx = {};
+    vm.createContext(ctx);
+    vm.runInContext(seg, ctx);
+    const isVid = ctx.isVideoSpecificFailure;
+
+    okc('取不到下载链接 = 视频级', isVid(new Error('tkdl: no download link')) === true);
+    okc('直链不可播 = 视频级', isVid(new Error('tkdl: link not playable')) === true);
+    okc('视频不可用 = 视频级', isVid(new Error('ssstik: video unavailable')) === true);
+    okc('非结果页 = 视频级', isVid(new Error('ssstik: not a result page')) === true);
+    okc('10204 = 视频级', isVid(new Error("item doesn't exist (10204)")) === true);
+    okc('HTTP 5xx = 通道故障（要计数）', isVid(new Error('backend HTTP 503')) === false);
+    okc('网络超时 = 通道故障', isVid(new Error('timeout')) === false);
+    okc('冷却提示 = 不算视频级', isVid(new Error('backend tkdl 冷却中（近期连续失败）')) === false);
+
+    // 冷却时长：首选源要短
+    const seg2 = extract(bg, 'const apiFailureCount', 'async function fetchAndParse');
+    const ctx2 = { URL, console, Date };
+    vm.createContext(ctx2);
+    vm.runInContext(seg2, ctx2);
+    okc('tkdl 冷却 60 秒', ctx2.cooldownMsFor('https://x.pages.dev#tkdl') === 60000, String(ctx2.cooldownMsFor('https://x.pages.dev#tkdl')));
+    okc('ssstik 冷却 60 秒', ctx2.cooldownMsFor('https://x.pages.dev#ssstik') === 60000);
+    okc('html 仍是 5 分钟', ctx2.cooldownMsFor('https://x.pages.dev#html') === 300000, String(ctx2.cooldownMsFor('https://x.pages.dev#html')));
+  }
+
   console.log(`\n========== 结果: ${pass} 通过 / ${fail} 失败 ==========`);
   process.exit(fail > 0 ? 1 : 0);
 })();
